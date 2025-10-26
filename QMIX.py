@@ -18,21 +18,13 @@ from IPython.display import display, Image as IPImage
 import torch.nn as nn
 import torch.nn.functional as F
 from dataclasses import dataclass
-
+import matplotlib.pyplot as plt
 ## Uncomment if you'd like to use your personal Google Drive to store outputs
 ## from your runs. You can find some hooks to Google Drive commented
 ## throughout the rest of this code.
 # from google.colab import drive
 
 ### Environment setup ###
-
-## Swap between the 3 layouts here:
-#layout = "cramped_room"
-layout = "coordination_ring"
-# layout = "counter_circuit_o_1order"
-IS_CRAMPED = (layout == "cramped_room")
-IS_RING = (layout == "coordination_ring")
-IS_CIRCUIT = (layout == "counter_circuit_o_1order")
 
 ## Reward shaping is disabled by default; i.e., only the sparse rewards are
 ## included in the reward returned by the enviornment).  If you'd like to do
@@ -50,11 +42,6 @@ reward_shaping = {
 # Length of Episodes.  Do not modify for your submission!
 # Modification will result in a grading penalty!
 horizon = 400
-
-# Build the environment.  Do not modify!
-mdp = OvercookedGridworld.from_layout_name(layout, rew_shaping_params=reward_shaping)
-base_env = OvercookedEnv.from_mdp(mdp, horizon=horizon, info_level=0)
-env = gym.make("Overcooked-v0", base_env=base_env, featurize_fn=base_env.featurize_state_mdp)
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -191,7 +178,48 @@ def compute_shaped_rewards(
 
     shaped_hit = int((r0_total != 0.0) or (r1_total != 0.0))
     return float(sparse_R), float(r0_total), float(r1_total), shaped_hit
+def sweep_layout(layout):
+    IS_CRAMPED = (layout == "cramped_room")
+    IS_RING = (layout == "coordination_ring")
+    IS_CIRCUIT = (layout == "counter_circuit_o_1order")
+    # Build the environment.  Do not modify!
+    mdp = OvercookedGridworld.from_layout_name(layout, rew_shaping_params=reward_shaping)
+    base_env = OvercookedEnv.from_mdp(mdp, horizon=horizon, info_level=0)
+    env = gym.make("Overcooked-v0", base_env=base_env, featurize_fn=base_env.featurize_state_mdp)
+    return env, base_env, IS_CIRCUIT, IS_CRAMPED, IS_RING
 
+def plot_training_metrics(results_dict, metric="reward",save_dir=None, filename=None, dpi=200, fmt="png",
+                          title_prefix="MAPPO training performance"):
+    """
+    results_dict: dict like {
+        'cramped': {'reward': list, 'soups': list},
+        'ring': {'reward': list, 'soups': list},
+        'circuit': {'reward': list, 'soups': list}
+    }
+    metric: 'reward' or 'soups'
+    """
+    plt.figure(figsize=(8,5))
+    for name, data in results_dict.items():
+        y = data['reward'] if metric == "reward" else data['soups']
+        x = np.arange(len(y)) * 10  # one point every 10 updates
+        plt.plot(x, y, label=name)
+    plt.xlabel("Training updates")
+    plt.ylabel("Mean " + ("return" if metric=="reward" else "soups/episode"))
+    plt.title(f"MAPPO training performance ({metric})")
+    plt.legend()
+    plt.grid(True, linestyle="--", alpha=0.5)
+    plt.tight_layout()
+
+    saved_path = None
+    if save_dir is not None:
+        os.makedirs(save_dir, exist_ok=True)
+        if filename is None:
+            filename = f"{metric}_curve"
+        saved_path = os.path.join(save_dir, f"{filename}.{fmt}")
+        plt.savefig(saved_path, dpi=dpi, format=fmt, bbox_inches="tight")
+
+    plt.show()
+    return saved_path
 # ===== QMIX components =====
 class AgentQ(nn.Module):
     def __init__(self, obs_dim, act_dim, hid=128):
@@ -348,6 +376,7 @@ class QMIX:
 
 def train_qmix(
     env,
+    layout,
     steps_total=600_000,
     start_learning=10_000,   # start updates sooner
     batch_size=256,
@@ -373,6 +402,7 @@ def train_qmix(
     interacts = 0
     adj = 0
     best_soups = -1.0
+    rewards_log, soups_log = [], []
     for step in range(1, steps_total + 1):
         # ---- pick actions (no masking during training) ----
 
@@ -428,7 +458,8 @@ def train_qmix(
             # greedy eval with a light interact mask for stability
             mean_ret, mean_soups = eval_qmix(agent, env, episodes=20)
             print(f"           eval_return={mean_ret:.1f} soups/ep={mean_soups:.2f}")
-
+            rewards_log.append(mean_ret)
+            soups_log.append(mean_soups)
             # IMPORTANT: eval used the same env; reset before resuming training
             obs = env.reset()
             o0, o1 = get_obs_pair(obs)
@@ -439,7 +470,7 @@ def train_qmix(
                     "mixer": agent.mixer.state_dict()
                 }, f"overcooked_{layout}_qmix.pt")
                 print(f"Checkpoint saved to overcooked_{layout}_qmix.pt")
-    return agent
+    return agent,rewards_log,soups_log
 
 
 @torch.no_grad()
@@ -463,9 +494,19 @@ def eval_qmix(agent: QMIX, env, episodes=20):
         rets.append(ep_ret)
     agent.eps = eps_bak
     return float(np.mean(rets)), soups / float(episodes)
-
-agent = train_qmix(env,
-                   steps_total=600_000,
-                   start_learning=5_000,
-                   batch_size=128,
-                   log_every=5000)
+Layouts=["cramped_room","coordination_ring","counter_circuit_o_1order"]
+Layouts=["coordination_ring"]
+results = {}
+for layout in Layouts:
+    env, base_env, IS_CIRCUIT, IS_CRAMPED,IS_RING, ckpt =sweep_layout(layout)
+    agent, rewards_log, soups_log = train_qmix(env,
+                                               steps_total=600_000,
+                                               start_learning=5_000,
+                                               batch_size=128,
+                                               log_every=5000)
+    results[layout.split('_')[0]] = {"reward": rewards_log, "soups": soups_log}
+# Plot both metrics
+plot_training_metrics(results, metric="reward",
+                      save_dir="plots", filename="qmix_reward")
+plot_training_metrics(results, metric="soups",
+                      save_dir="plots", filename="qmix_soups")
