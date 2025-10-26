@@ -1,0 +1,7 @@
+gym==0.25.2
+ipython==8.12.3
+numpy==1.24.4
+Pillow==10.2.0
+protobuf==4.25.3
+jupyter
+ipykernel
