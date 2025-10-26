@@ -312,8 +312,8 @@ def train_mappo(env, updates=2000, rollout_steps=1024, shaping_scale=1.0):
     best_soups = -1.0
     shaped_hits=0.0
     total_steps = 0
-    for upd in range(1, agent.cfg.total_updates+1):
-        buf = {k: [] for k in ["obs","act","logp","rew","done","val","joint_obs"]}
+    for upd in range(1, agent.cfg.total_updates + 1):
+        buf = {k: [] for k in ["obs", "act", "logp", "rew", "done", "val", "joint_obs"]}
         steps = 0
         while steps < agent.cfg.rollout_env_steps:
             # actions for both agents from shared actor
@@ -335,7 +335,7 @@ def train_mappo(env, updates=2000, rollout_steps=1024, shaping_scale=1.0):
 
             # recompute logp for the FINAL executed actions
             with torch.no_grad():
-                lp0 = float\
+                lp0 = float \
                     (dist0.log_prob(torch.tensor(a0_exec, device=device)).cpu().item())
                 lp1 = float(dist1.log_prob(torch.tensor(a1_exec, device=device)).cpu().item())
 
@@ -346,34 +346,27 @@ def train_mappo(env, updates=2000, rollout_steps=1024, shaping_scale=1.0):
             obs, R, done, info = env.step([a0_exec, a1_exec])
 
             # team reward: sparse + mild shaped average
-            R_team, r0_shape, r1_shape, shaped_hit = compute_shaped_rewards(
-                info, env, step=total_steps, sparse_R=float(R),
-                early_shape_steps=50_000, shape_scale_max=6.0, shape_scale_min=1.0
-            )
+            shape_scale = 2.0 if upd <= 200 else agent.cfg.shaping_scale
+            r = float(R) + shaped_team_reward(info, env, scale=shape_scale)
 
-            # store transitions for BOTH agents
-            for (ob, ac, lp, rsh) in [(o0, a0_exec, lp0, r0_shape), (o1, a1_exec, lp1, r1_shape)]:
+            # store transitions for BOTH agents (use executed actions + correct logp)
+            for ob, ac, lp in [(o0, a0_exec, lp0), (o1, a1_exec, lp1)]:
                 buf["obs"].append(ob)
                 buf["act"].append(ac)
                 buf["logp"].append(lp)
-                buf["rew"].append(R_team + rsh)  # per-agent combined reward
+                buf["rew"].append(r)
                 buf["done"].append(float(done))
                 buf["val"].append(v)
-                buf["joint_obs"].append(joint)  # whatever you already use
-
-            # optional running stat
-            shaped_hits += shaped_hit
+                buf["joint_obs"].append(joint)
 
             o0, o1 = get_obs_pair(obs)
             steps += 1
-            total_steps += 1
             if done:
                 obs = env.reset()
                 o0, o1 = get_obs_pair(obs)
         shaped_hits = sum(1 for rr in buf["rew"] if (rr != 0.0 and rr < 20.0))
         print(f"[upd {upd}] shaped_hit_rate={shaped_hits / len(buf['rew']):.3f}")
         for k in buf: buf[k] = np.asarray(buf[k], dtype=np.float32)
-
         # GAE
         g, l = agent.cfg.gamma, agent.cfg.lam
         rews, vals, dones = buf["rew"], buf["val"], buf["done"]
