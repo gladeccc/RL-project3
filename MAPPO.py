@@ -19,7 +19,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from dataclasses import dataclass
 import matplotlib.pyplot as plt
-
+from gym.vector import AsyncVectorEnv
 
 ## Uncomment if you'd like to use your personal Google Drive to store outputs
 ## from your runs. You can find some hooks to Google Drive commented
@@ -51,7 +51,7 @@ horizon = 400
 
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-
+device = "cpu"
 def get_obs_pair(obs_dict):
     # Your env returns dict; features are already aligned for obs order
     return obs_dict["both_agent_obs"][0], obs_dict["both_agent_obs"][1]
@@ -231,6 +231,25 @@ def plot_training_metrics(results_dict, metric="reward",save_dir=None, filename=
     plt.show()
     return saved_path
 
+# ---------- helpers to build vector envs ----------
+def make_overcooked_env(layout, reward_shaping, horizon):
+    def _init():
+        mdp = OvercookedGridworld.from_layout_name(layout, rew_shaping_params=reward_shaping)
+        base = OvercookedEnv.from_mdp(mdp, horizon=horizon, info_level=0)
+        return gym.make("Overcooked-v0", base_env=base, featurize_fn=base.featurize_state_mdp)
+    return _init
+
+def build_vec_env(layouts, copies_per_layout=2):
+    env_fns = []
+    layout_ids = []
+    for l in layouts:
+        for _ in range(copies_per_layout):
+            env_fns.append(make_overcooked_env(l, reward_shaping, horizon))
+            layout_ids.append(l)
+    vec = AsyncVectorEnv(env_fns)
+    layout_ids = np.array(layout_ids)  # shape (N,)
+    return vec, layout_ids
+
 class Actor(nn.Module):
     # Produces logits over 6 discrete actions for ONE agent
     def __init__(self, obs_dim, act_dim):
@@ -342,14 +361,14 @@ class ObsNorm:
 
 
 
-def train_mappo(env, IS_CIRCUIT,IS_RING, updates=2000, rollout_steps=2048, shaping_scale=1.0):
+def train_mappo(env, updates=2000, rollout_steps=2048, shaping_scale=1.0):
     # Probe dims
     obs = env.reset()
     o0, o1 = get_obs_pair(obs)
     obs_dim = o0.shape[0]; act_dim = env.action_space.n
 
-    # Running normalizer
-    obsnorm = ObsNorm(obs_dim)
+    # # Running normalizer
+    # obsnorm = ObsNorm(obs_dim)
 
     agent = PPOMulti(obs_dim, act_dim, PPOCfg(
         total_updates=updates, rollout_env_steps=rollout_steps, shaping_scale=shaping_scale
@@ -358,35 +377,35 @@ def train_mappo(env, IS_CIRCUIT,IS_RING, updates=2000, rollout_steps=2048, shapi
     best_soups = -1.0
     rewards_log, soups_log = [], []
     for upd in range(1, agent.cfg.total_updates + 1):
-        obs = env.reset()
-        o0, o1 = get_obs_pair(obs)
-        # simple entropy schedule (optional but helps)
-        if upd <= int(0.3 * agent.cfg.total_updates):
-            agent.cfg.ent_coef = 0.03
-        elif upd <= int(0.7 * agent.cfg.total_updates):
-            agent.cfg.ent_coef = 0.015
-        else:
-            agent.cfg.ent_coef = 0.007
+        # # simple entropy schedule (optional but helps)
+        # if upd <= int(0.3 * agent.cfg.total_updates):
+        #     agent.cfg.ent_coef = 0.03
+        # elif upd <= int(0.7 * agent.cfg.total_updates):
+        #     agent.cfg.ent_coef = 0.015
+        # else:
+        #     agent.cfg.ent_coef = 0.007
 
         buf = {k: [] for k in ["obs","act","logp","rew","done","val","joint_obs"]}
         steps = 0
 
         while steps < agent.cfg.rollout_env_steps:
             # update stats BEFORE using
-            obsnorm.update(o0); obsnorm.update(o1)
-            o0n = obsnorm.apply(o0)
-            o1n = obsnorm.apply(o1)
+            # obsnorm.update(o0); obsnorm.update(o1)
+            # o0n = obsnorm.apply(o0)
+            # o1n = obsnorm.apply(o1)
 
             # sample actions from NORMALIZED inputs
-            x0 = torch.as_tensor(o0n[None,:], dtype=torch.float32, device=device)
-            x1 = torch.as_tensor(o1n[None,:], dtype=torch.float32, device=device)
+            # x0 = torch.as_tensor(o0n[None,:], dtype=torch.float32, device=device)
+            # x1 = torch.as_tensor(o1n[None,:], dtype=torch.float32, device=device)
+            x0 = torch.as_tensor(o0[None, :], dtype=torch.float32, device=device)
+            x1 = torch.as_tensor(o1[None, :], dtype=torch.float32, device=device)
             with torch.no_grad():
                 dist0 = agent.dist(agent.actor(x0))
                 dist1 = agent.dist(agent.actor(x1))
                 a0 = int(dist0.sample().item())
                 a1 = int(dist1.sample().item())
 
-            if upd <= 300 and np.random.rand() < 0.5:
+            if upd <= 300 and np.random.rand() < 0.7:
                 a0_exec, a1_exec = mask_interact(o0, o1, a0, a1)
                 a0_exec, a1_exec = maybe_bias_actions(steps, upd, a0_exec, a1_exec, o0, o1)
             else:
@@ -398,19 +417,22 @@ def train_mappo(env, IS_CIRCUIT,IS_RING, updates=2000, rollout_steps=2048, shapi
                 lp1 = float(dist1.log_prob(torch.tensor(a1_exec, device=device)).cpu().item())
 
             # critic sees NORMALIZED joint
-            joint = np.concatenate([o0n, o1n], axis=-1)
+            # joint = np.concatenate([o0n, o1n], axis=-1)
+            joint = np.concatenate([o0, o1], axis=-1)
             v = agent.value(joint[None,:])[0]
 
             # step env
             obs, R, done, info = env.step([a0_exec, a1_exec])
 
             # sparse + mild shaped reward
-            shape_scale = 4.0 if upd <= 200 else agent.cfg.shaping_scale
+            shape_scale = 8.0 if upd <= 200 else agent.cfg.shaping_scale
             r = float(R) + shaped_team_reward(info, env, scale=shape_scale)
 
             # store NORMALIZED obs so training matches sampling distribution
-            for ob_n, ac, lp in [(o0n, a0_exec, lp0), (o1n, a1_exec, lp1)]:
-                buf["obs"].append(ob_n)
+            # for ob_n, ac, lp in [(o0n, a0_exec, lp0), (o1n, a1_exec, lp1)]:
+            for ob, ac, lp in [(o0, a0_exec, lp0), (o1, a1_exec, lp1)]:
+                # buf["obs"].append(ob_n)
+                buf["obs"].append(ob)
                 buf["act"].append(ac)
                 buf["logp"].append(lp)
                 buf["rew"].append(r)
@@ -447,57 +469,53 @@ def train_mappo(env, IS_CIRCUIT,IS_RING, updates=2000, rollout_steps=2048, shapi
         adv = (adv - adv.mean())/(adv.std()+1e-8)
 
         batch = {
-            "obs": buf["obs"],                       # normalized
+            "obs": buf["obs"],
             "act": buf["act"].astype(np.int64),
             "logp": buf["logp"],
             "adv": adv,
             "ret": ret,
-            "joint_obs": buf["joint_obs"]            # normalized joint
+            "joint_obs": buf["joint_obs"]
         }
         agent.update(batch)
 
         if upd % 10 == 0:
-            mean_ret, mean_soups = eval_soups(agent, env, episodes=30, obsnorm=obsnorm)
+            mean_ret, mean_soups = eval_soups(agent, env, episodes=30)
             rewards_log.append(mean_ret)
             soups_log.append(mean_soups)
             print(f"[upd {upd}] return≈ {mean_ret:.1f}  soups≈ {mean_soups:.2f}  "
                   f"ratio≈ {mean_ret / (20 * max(1e-6, mean_soups)):.2f}")
-
+            obs = env.reset()
+            o0, o1 = get_obs_pair(obs)
             if best_soups < mean_soups:
                 best_soups = mean_soups
                 torch.save({
                     "actor": agent.actor.state_dict(),
                     "critic": agent.critic.state_dict(),
-                    "obsnorm_m": obsnorm.m,
-                    "obsnorm_s": obsnorm.s,
-                    "obsnorm_n": obsnorm.n
+                    # "obsnorm_m": obsnorm.m,
+                    # "obsnorm_s": obsnorm.s,
+                    # "obsnorm_n": obsnorm.n
                 }, f"overcooked_{layout}.pt")
                 print(f"Checkpoint saved to overcooked_{layout}.pt")
 
     print(f"Best soups/ep observed: {best_soups:.2f}")
-    return agent, obsnorm, rewards_log, soups_log
+    return agent, rewards_log, soups_log
 
 @torch.no_grad()
-def eval_soups(agent, env, episodes=20, obsnorm=None):
+def eval_soups(agent, env, episodes=20):
     rets, soups = [], 0
     for _ in range(episodes):
         obs = env.reset()
         o0, o1 = get_obs_pair(obs)
         done, ep_ret = False, 0.0
         while not done:
-            o0n = obsnorm.apply(o0) if obsnorm else o0
-            o1n = obsnorm.apply(o1) if obsnorm else o1
-            x0 = torch.as_tensor(o0n[None,:], dtype=torch.float32, device=device)
-            x1 = torch.as_tensor(o1n[None,:], dtype=torch.float32, device=device)
-            logits0 = agent.actor(x0); logits1 = agent.actor(x1)
-            a0 = int(torch.argmax(logits0, dim=-1).item())
-            a1 = int(torch.argmax(logits1, dim=-1).item())
-            obs, R, done, info = env.step([a0, a1])
+            a0, _ = agent.act(o0[None, :]);
+            a1, _ = agent.act(o1[None, :])
+            obs, R, done, info = env.step([int(a0[0]), int(a1[0])])
             ep_ret += float(R)
             soups += count_delivery(float(R), info)
             o0, o1 = get_obs_pair(obs)
         rets.append(ep_ret)
-    return float(np.mean(rets)), soups/float(episodes)
+    return float(np.mean(rets)), soups / float(episodes)
 
 ### All of the remaining code in this notebook is solely for using the
 ### built-in Overcooked state visualizer on a trained agent, so that you can see
@@ -542,7 +560,7 @@ def sweep_layout(layout):
     ckpt = None
 
     if IS_CIRCUIT:
-        ckpt = torch.load("overcooked_counter_circuit_o_1order.pt", map_location="cpu")
+        ckpt = torch.load("overcooked_counter_circuit_o_1order_MAPPO.pt", map_location="cpu")
         print("overcooked_counter_circuit_o_1order.pt loaded")
         agent.actor.load_state_dict(ckpt["actor"])
         agent.critic.load_state_dict(ckpt["critic"])
@@ -550,11 +568,11 @@ def sweep_layout(layout):
     return env, base_env, IS_CIRCUIT, IS_CRAMPED,IS_RING, ckpt
 
 Layouts=["cramped_room","coordination_ring","counter_circuit_o_1order"]
-Layouts=["coordination_ring"]
 results = {}
 for layout in Layouts:
+    print(f"layout is {layout}")
     env, base_env, IS_CIRCUIT, IS_CRAMPED,IS_RING, ckpt =sweep_layout(layout)
-    agent, obsnorm, rewards_log, soups_log = train_mappo(env,IS_CIRCUIT,IS_RING, updates=1200, rollout_steps=1024, shaping_scale=1.0)
+    agent, rewards_log, soups_log = train_mappo(env, updates=1200, rollout_steps=1024, shaping_scale=1.0)
     if ckpt:
         agent.actor.load_state_dict(ckpt["actor"]); agent.critic.load_state_dict(ckpt["critic"])
     results[layout.split('_')[0]] = {"reward": rewards_log, "soups": soups_log}

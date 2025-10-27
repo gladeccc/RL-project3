@@ -257,9 +257,9 @@ def trace_episode(env, actor, steps=400, mask_interact=False):
     print("\nEpisode done. Deliveries:", deliveries, "| Served at steps:", served_steps)
 
 if __name__ == "__main__":
-    # layout = "cramped_room"
-    # layout = "coordination_ring"
-    layout = "counter_circuit_o_1order"
+    layout = "cramped_room"
+    #layout = "coordination_ring"
+    #layout = "counter_circuit_o_1order"
     env, actor = load_trained_model(layout)
     evaluate(actor, env, episodes=20)
     trace_episode(env, actor)
