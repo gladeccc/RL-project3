@@ -410,7 +410,7 @@ def train_qmix(
         MASK_PROB = 0.3  # 30% of the time, clean up obviously useless Interact
         if np.random.rand() < MASK_PROB:
             a0, a1 = mask_interact(o0, o1, a0, a1)  # remember your fix: returns (a0,a1)
-        a0, a1 = maybe_bias_moves(step, a0, a1, o0, o1)
+            a0, a1 = maybe_bias_moves(step, a0, a1, o0, o1)
         # ---- step env ----
         next_obs, R, done, info = env.step([a0, a1])
 
@@ -419,7 +419,6 @@ def train_qmix(
             early_shape_steps=20_000, shape_scale_max=6.0, shape_scale_min=1.0
         )
 
-        # Option A (simple): fold both agents’ shaping into a single scalar
         r_team_shaped = R_team + 0.5 * (r0_shape + r1_shape)
 
         # push to replay (unchanged structure), using r_team_shaped as 'r'
@@ -494,12 +493,15 @@ def eval_qmix(agent: QMIX, env, episodes=20):
         rets.append(ep_ret)
     agent.eps = eps_bak
     return float(np.mean(rets)), soups / float(episodes)
+
+
 Layouts=["cramped_room","coordination_ring","counter_circuit_o_1order"]
-Layouts=["coordination_ring"]
 results = {}
 for layout in Layouts:
-    env, base_env, IS_CIRCUIT, IS_CRAMPED,IS_RING, ckpt =sweep_layout(layout)
+    print(f"layout={layout}")
+    env, base_env, IS_CIRCUIT, IS_CRAMPED,IS_RING= sweep_layout(layout)
     agent, rewards_log, soups_log = train_qmix(env,
+                                               layout,
                                                steps_total=600_000,
                                                start_learning=5_000,
                                                batch_size=128,
