@@ -248,6 +248,13 @@ def build_vec_env(layouts, copies_per_layout=2):
     layout_ids = np.array(layout_ids)  # shape (N,)
     return vec, layout_ids
 
+def get_layout_norm(layout_name: str, env, pool: dict):
+    if layout_name not in pool:
+        obs = env.reset()
+        o0, _ = get_obs_pair(obs)
+        pool[layout_name] = ObsNorm(dim=o0.shape[0])  # your ObsNorm class
+    return pool[layout_name]
+
 class Actor(nn.Module):
     # Produces logits over 6 discrete actions for ONE agent
     def __init__(self, obs_dim, act_dim):
@@ -498,14 +505,11 @@ def train_mappo(env, updates=2000, rollout_steps=2048, shaping_scale=1.0):
     print(f"Best soups/ep observed: {best_soups:.2f}")
     return agent, rewards_log, soups_log
 
-def train_mappo_norm(env, updates=2000, rollout_steps=2048, shaping_scale=1.0):
+def train_mappo_norm(env,  obsnorm, updates=2000, rollout_steps=2048, shaping_scale=1.0):
     # Probe dims
     obs = env.reset()
     o0, o1 = get_obs_pair(obs)
     obs_dim = o0.shape[0]; act_dim = env.action_space.n
-
-    # # Running normalizer
-    obsnorm = ObsNorm(obs_dim)
 
     agent = PPOMulti(obs_dim, act_dim, PPOCfg(
         total_updates=updates, rollout_env_steps=rollout_steps, shaping_scale=shaping_scale
@@ -515,12 +519,12 @@ def train_mappo_norm(env, updates=2000, rollout_steps=2048, shaping_scale=1.0):
     rewards_log, soups_log = [], []
     for upd in range(1, agent.cfg.total_updates + 1):
         # # simple entropy schedule (optional but helps)
-        if upd <= int(0.3 * agent.cfg.total_updates):
-            agent.cfg.ent_coef = 0.03
-        elif upd <= int(0.7 * agent.cfg.total_updates):
-            agent.cfg.ent_coef = 0.015
-        else:
-            agent.cfg.ent_coef = 0.007
+        # if upd <= int(0.3 * agent.cfg.total_updates):
+        #     agent.cfg.ent_coef = 0.03
+        # elif upd <= int(0.7 * agent.cfg.total_updates):
+        #     agent.cfg.ent_coef = 0.015
+        # else:
+        #     agent.cfg.ent_coef = 0.007
 
         buf = {k: [] for k in ["obs","act","logp","rew","done","val","joint_obs"]}
         steps = 0
@@ -534,8 +538,6 @@ def train_mappo_norm(env, updates=2000, rollout_steps=2048, shaping_scale=1.0):
             # sample actions from NORMALIZED inputs
             x0 = torch.as_tensor(o0n[None,:], dtype=torch.float32, device=device)
             x1 = torch.as_tensor(o1n[None,:], dtype=torch.float32, device=device)
-            # x0 = torch.as_tensor(o0[None, :], dtype=torch.float32, device=device)
-            # x1 = torch.as_tensor(o1[None, :], dtype=torch.float32, device=device)
             with torch.no_grad():
                 dist0 = agent.dist(agent.actor(x0))
                 dist1 = agent.dist(agent.actor(x1))
@@ -547,11 +549,11 @@ def train_mappo_norm(env, updates=2000, rollout_steps=2048, shaping_scale=1.0):
                 a0_exec, a1_exec = maybe_bias_actions(steps, upd, a0_exec, a1_exec, o0, o1)
             else:
                 a0_exec, a1_exec = a0, a1
-
+            a0e, a1e = a0_exec, a1_exec  # keep whatever ring/circuit tweaks you already do
             # recompute logp for executed actions from the same dists
             with torch.no_grad():
-                lp0 = float(dist0.log_prob(torch.tensor(a0_exec, device=device)).cpu().item())
-                lp1 = float(dist1.log_prob(torch.tensor(a1_exec, device=device)).cpu().item())
+                lp0 = float(dist0.log_prob(torch.tensor(a0e, device=device)).cpu().item())
+                lp1 = float(dist1.log_prob(torch.tensor(a1e, device=device)).cpu().item())
 
             # critic sees NORMALIZED joint
             joint = np.concatenate([o0n, o1n], axis=-1)
@@ -559,14 +561,14 @@ def train_mappo_norm(env, updates=2000, rollout_steps=2048, shaping_scale=1.0):
             v = agent.value(joint[None,:])[0]
 
             # step env
-            obs, R, done, info = env.step([a0_exec, a1_exec])
+            obs, R, done, info = env.step([a0e, a1e])
 
             # sparse + mild shaped reward
             shape_scale = 8.0 if upd <= 200 else agent.cfg.shaping_scale
             r = float(R) + shaped_team_reward(info, env, scale=shape_scale)
 
             # store NORMALIZED obs so training matches sampling distribution
-            for ob_n, ac, lp in [(o0n, a0_exec, lp0), (o1n, a1_exec, lp1)]:
+            for ob_n, ac, lp in [(o0n, a0e, lp0), (o1n, a1e, lp1)]:
             # for ob, ac, lp in [(o0, a0_exec, lp0), (o1, a1_exec, lp1)]:
                 buf["obs"].append(ob_n)
                 # buf["obs"].append(ob)
@@ -758,10 +760,12 @@ plot_training_metrics(results, metric="soups",
                       save_dir="plots", filename="mappo_soups")
 """
 results = {}
+obsnorm_by_layout = {}
 for layout in Layouts:
     print(f"layout is {layout}")
     env, base_env, IS_CIRCUIT, IS_CRAMPED,IS_RING, ckpt =sweep_layout(layout)
-    agent, rewards_log, soups_log = train_mappo_norm(env, updates=2000, rollout_steps=1024, shaping_scale=1.0)
+    norm = get_layout_norm(layout, env, obsnorm_by_layout)
+    agent, rewards_log, soups_log = train_mappo_norm(env, norm, updates=2000, rollout_steps=1024, shaping_scale=1.0)
     if ckpt:
         agent.actor.load_state_dict(ckpt["actor"]); agent.critic.load_state_dict(ckpt["critic"])
     results[layout.split('_')[0]] = {"reward": rewards_log, "soups": soups_log}
@@ -771,21 +775,19 @@ plot_training_metrics(results, metric="reward",
 plot_training_metrics(results, metric="soups",
                       save_dir="plots", filename="mappo_soups_norm")
 
-# ====== Visualization using the existing flow ======
-# from overcooked_ai_py.agents.agent import AgentFromPolicy, AgentPair
-# from overcooked_ai_py.agents.benchmarking import AgentEvaluator
-# from overcooked_ai_py.visualization.state_visualizer import StateVisualizer
-#
-# policy0 = StudentPolicy(agent.actor)
-# policy1 = StudentPolicy(agent.actor)
-# agent0 = AgentFromPolicy(policy0)
-# agent1 = AgentFromPolicy(policy1)
-# agent_pair = AgentPair(agent0, agent1)
-#
-# ae = AgentEvaluator.from_layout_name({"layout_name": layout}, {"horizon": horizon})
-# trajs = ae.evaluate_agent_pair(agent_pair, num_games=1)
-# print("len(trajs):", len(trajs))
-#
-# img_dir = "imgs/"
-# ipython_display = True
-# StateVisualizer().display_rendered_trajectory(trajs, img_directory_path=img_dir, ipython_display=ipython_display)
+##====== Visualization using the existing flow ======
+
+
+policy0 = StudentPolicy(agent.actor)
+policy1 = StudentPolicy(agent.actor)
+agent0 = AgentFromPolicy(policy0)
+agent1 = AgentFromPolicy(policy1)
+agent_pair = AgentPair(agent0, agent1)
+
+ae = AgentEvaluator.from_layout_name({"layout_name": layout}, {"horizon": horizon})
+trajs = ae.evaluate_agent_pair(agent_pair, num_games=1)
+print("len(trajs):", len(trajs))
+
+img_dir = "imgs/"
+ipython_display = True
+StateVisualizer().display_rendered_trajectory(trajs, img_directory_path=img_dir, ipython_display=ipython_display)
