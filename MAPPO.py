@@ -375,13 +375,13 @@ def train_mappo(env, updates=2000, rollout_steps=2048, shaping_scale=1.0):
     best_soups = -1.0
     rewards_log, soups_log = [], []
     for upd in range(1, agent.cfg.total_updates + 1):
-        # # simple entropy schedule (optional but helps)
-        # if upd <= int(0.3 * agent.cfg.total_updates):
-        #     agent.cfg.ent_coef = 0.03
-        # elif upd <= int(0.7 * agent.cfg.total_updates):
-        #     agent.cfg.ent_coef = 0.015
-        # else:
-        #     agent.cfg.ent_coef = 0.007
+        # simple entropy schedule (optional but helps)
+        if upd <= int(0.3 * agent.cfg.total_updates):
+            agent.cfg.ent_coef = 0.03
+        elif upd <= int(0.7 * agent.cfg.total_updates):
+            agent.cfg.ent_coef = 0.015
+        else:
+            agent.cfg.ent_coef = 0.007
 
         buf = {k: [] for k in ["obs","act","logp","rew","done","val","joint_obs"]}
         steps = 0
@@ -616,7 +616,7 @@ def train_mappo_norm(env, updates=2000, rollout_steps=2048, shaping_scale=1.0):
         agent.update(batch)
 
         if upd % 10 == 0:
-            mean_ret, mean_soups = eval_soups(agent, env, episodes=30)
+            mean_ret, mean_soups = eval_soups_norm(agent, env, obsnorm,episodes=30)
             rewards_log.append(mean_ret)
             soups_log.append(mean_soups)
             print(f"[upd {upd}] return≈ {mean_ret:.1f}  soups≈ {mean_soups:.2f}  "
@@ -631,8 +631,8 @@ def train_mappo_norm(env, updates=2000, rollout_steps=2048, shaping_scale=1.0):
                     "obsnorm_m": obsnorm.m,
                     "obsnorm_s": obsnorm.s,
                     "obsnorm_n": obsnorm.n
-                }, f"overcooked_{layout}.pt")
-                print(f"Checkpoint saved to overcooked_{layout}.pt")
+                }, f"overcooked_{layout}_norm.pt")
+                print(f"Checkpoint saved to overcooked_{layout}_norm.pt")
 
     print(f"Best soups/ep observed: {best_soups:.2f}")
     return agent, rewards_log, soups_log
@@ -653,6 +653,43 @@ def eval_soups(agent, env, episodes=20):
             o0, o1 = get_obs_pair(obs)
         rets.append(ep_ret)
     return float(np.mean(rets)), soups / float(episodes)
+
+@torch.no_grad()
+def eval_soups_norm(agent, env, obsnorm, episodes=20):
+    """
+    Evaluate MAPPO agent trained with normalized observations.
+    Args:        agent: trained PPOMulti agent
+    env: Overcooked environment instance
+    obsnorm: ObsNorm instance with stored mean/var stats
+    episodes: number of evaluation episodes
+    Returns:        mean_reward: float,
+    average sparse return
+    mean_soups: float, average soups delivered per episode
+    """
+    rets, soups = [], 0
+    for _ in range(episodes):
+        obs = env.reset()
+        o0, o1 = obs["both_agent_obs"]
+        done, ep_ret = False, 0.0
+        while not done:
+    # Normalize each agent’s observation
+         o0n = obsnorm.apply(o0)
+         o1n = obsnorm.apply(o1)
+         # Actor forward (greedy)
+         x0 = torch.as_tensor(o0n[None, :], dtype=torch.float32, device=device)
+         x1 = torch.as_tensor(o1n[None, :], dtype=torch.float32, device=device)
+         a0 = int(torch.argmax(agent.actor(x0), dim=-1).item())
+         a1 = int(torch.argmax(agent.actor(x1), dim=-1).item())            # Step env
+         a0, a1 = mask_interact(o0, o1, a0, a1)  # same hygiene as training
+
+         obs, R, done, info = env.step([a0, a1])
+         ep_ret += float(R)
+         soups += count_delivery(float(R), info)
+         o0, o1 = obs["both_agent_obs"]
+        rets.append(ep_ret)
+    mean_reward = float(np.mean(rets))
+    mean_soups = soups / float(episodes)
+    return mean_reward, mean_soups
 
 ### All of the remaining code in this notebook is solely for using the
 ### built-in Overcooked state visualizer on a trained agent, so that you can see
@@ -705,11 +742,12 @@ def sweep_layout(layout):
     return env, base_env, IS_CIRCUIT, IS_CRAMPED,IS_RING, ckpt
 
 Layouts=["cramped_room","coordination_ring","counter_circuit_o_1order"]
+"""
 results = {}
 for layout in Layouts:
     print(f"layout is {layout}")
     env, base_env, IS_CIRCUIT, IS_CRAMPED,IS_RING, ckpt =sweep_layout(layout)
-    agent, rewards_log, soups_log = train_mappo(env, updates=1200, rollout_steps=1024, shaping_scale=1.0)
+    agent, rewards_log, soups_log = train_mappo(env, updates=2000, rollout_steps=1024, shaping_scale=1.0)
     if ckpt:
         agent.actor.load_state_dict(ckpt["actor"]); agent.critic.load_state_dict(ckpt["critic"])
     results[layout.split('_')[0]] = {"reward": rewards_log, "soups": soups_log}
@@ -718,12 +756,12 @@ plot_training_metrics(results, metric="reward",
                       save_dir="plots", filename="mappo_reward")
 plot_training_metrics(results, metric="soups",
                       save_dir="plots", filename="mappo_soups")
-
+"""
 results = {}
 for layout in Layouts:
     print(f"layout is {layout}")
     env, base_env, IS_CIRCUIT, IS_CRAMPED,IS_RING, ckpt =sweep_layout(layout)
-    agent, rewards_log, soups_log = train_mappo_norm(env, updates=1200, rollout_steps=1024, shaping_scale=1.0)
+    agent, rewards_log, soups_log = train_mappo_norm(env, updates=2000, rollout_steps=1024, shaping_scale=1.0)
     if ckpt:
         agent.actor.load_state_dict(ckpt["actor"]); agent.critic.load_state_dict(ckpt["critic"])
     results[layout.split('_')[0]] = {"reward": rewards_log, "soups": soups_log}
