@@ -37,9 +37,17 @@ from gym.vector import AsyncVectorEnv
 ## in lieu of, or in addition to, using this structure. The shaped rewards
 ## provided by this structure will appear in a different place (see below)
 reward_shaping = {
-    "PLACEMENT_IN_POT_REW": 3,
+    "NEAR_POT_REWARD": 1,
+    "ONION_PICKUP_REW": 2,
+    "NEAR_DISH_REWARD": 1,
+    "PLACEMENT_IN_POT_REW": 4,
     "DISH_PICKUP_REWARD": 3,
-    "SOUP_PICKUP_REWARD": 5
+    "SOUP_PICKUP_REWARD": 5,
+    "PICKUP_WRONG_OBJ_PEN":-1,
+    "DROP_OBJ_PENALTY":-1,
+    "USEFUL_INTERACT_REWARD": 1,     # if supported
+    "INVALID_INTERACT_PENALTY": -2,  # if supported
+    "STEP_COST": 0                   # if supported
 }
 
 # Length of Episodes.  Do not modify for your submission!

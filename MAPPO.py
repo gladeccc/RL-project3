@@ -39,9 +39,17 @@ from gym.vector import AsyncVectorEnv
 ## in lieu of, or in addition to, using this structure. The shaped rewards
 ## provided by this structure will appear in a different place (see below)
 reward_shaping = {
-    "PLACEMENT_IN_POT_REW": 3,
+    "NEAR_POT_REWARD": 1,
+    "ONION_PICKUP_REW": 2,
+    "NEAR_DISH_REWARD": 1,
+    "PLACEMENT_IN_POT_REW": 4,
     "DISH_PICKUP_REWARD": 3,
-    "SOUP_PICKUP_REWARD": 5
+    "SOUP_PICKUP_REWARD": 5,
+    "PICKUP_WRONG_OBJ_PEN":-1,
+    "DROP_OBJ_PENALTY":-1,
+    "USEFUL_INTERACT_REWARD": 1,     # if supported
+    "INVALID_INTERACT_PENALTY": -2,  # if supported
+    "STEP_COST": 0                   # if supported
 }
 
 # Length of Episodes.  Do not modify for your submission!
@@ -318,6 +326,109 @@ def visualization_using_existing_flow(agent,layout, use_norm=False, obsnorm=None
     ipython_display = True
     StateVisualizer().display_rendered_trajectory(trajs, img_directory_path=img_dir, ipython_display=ipython_display)
 
+class PotentialShapingWrapper(gym.Wrapper):
+    """
+    Potential-based reward shaping:
+      F(s,a,s') = gamma * Phi(s') - Phi(s) + small event bonuses/penalties.
+    Works with featurized obs vectors (96-D); no layout-specific indices required.
+    """
+    def __init__(self, env, gamma=0.99,
+                 progress_w=0.08,         # distance reduction weight per agent
+                 adj_interact_bonus=0.2,  # reward if INTERACT at adjacency
+                 head_on_penalty=-0.05,   # discourage head-on collisions in corridors
+                 anneal_steps=150_000):   # linearly anneal shaping to ~0
+        super().__init__(env)
+        self.gamma = gamma
+        self.progress_w = progress_w
+        self.adj_interact_bonus = adj_interact_bonus
+        self.head_on_penalty = head_on_penalty
+        self.anneal_steps = max(1, anneal_steps)
+        self.total_steps = 0
+        self.prev_phi_0 = 0.0
+        self.prev_phi_1 = 0.0
+        self.prev_obs = None
+
+    @staticmethod
+    def _min_nearby_manhattan(obs_vec: np.ndarray, radius_cap: int = 6) -> float:
+        """
+        Scan obs for (dx,dy) pairs. Treat small |dx|+|dy| as 'nearby station' candidates.
+        Return the minimum capped Manhattan distance we can find.
+        """
+        best = 999.0
+        v = obs_vec
+        for i in range(0, len(v)-1):
+            dx, dy = v[i], v[i+1]
+            m = abs(dx) + abs(dy)
+            if 0 < m < best and m <= radius_cap:
+                best = m
+        return best if best < 999.0 else radius_cap
+
+    @staticmethod
+    def _likely_adjacent(obs_vec: np.ndarray) -> bool:
+        v = obs_vec.astype(np.int32)
+        for i in range(0, len(v)-1):
+            dx, dy = v[i], v[i+1]
+            if (abs(dx) == 1 and dy == 0) or (abs(dy) == 1 and dx == 0):
+                return True
+        return False
+
+    @staticmethod
+    def _is_head_on(a0: int, a1: int) -> bool:
+        # 0:stay, 1:up, 2:down, 3:left, 4:right, 5:interact
+        return (a0 == 1 and a1 == 2) or (a0 == 2 and a1 == 1) or (a0 == 3 and a1 == 4) or (a0 == 4 and a1 == 3)
+
+    def reset(self, **kwargs):
+        self.prev_phi_0 = 0.0
+        self.prev_phi_1 = 0.0
+        self.prev_obs = super().reset(**kwargs)
+        return self.prev_obs
+
+    def step(self, actions):
+        obs, sparse_R, done, info = super().step(actions)
+
+        # Extract both-agent 96-D obs
+        o0, o1 = obs["both_agent_obs"]
+        # Fresh potentials (smaller is closer => we invert so larger is better)
+        d0 = self._min_nearby_manhattan(o0)
+        d1 = self._min_nearby_manhattan(o1)
+        phi0 = -d0
+        phi1 = -d1
+
+        # Anneal shaping multiplier over time to avoid breadcrumb addiction
+        alpha = max(0.0, 1.0 - (self.total_steps / float(self.anneal_steps)))
+
+        # Potential-based progress (team sum keeps it cooperative)
+        F0 = self.gamma * phi0 - self.prev_phi_0
+        F1 = self.gamma * phi1 - self.prev_phi_1
+        progress_bonus = self.progress_w * (max(0.0, F0) + max(0.0, F1))
+
+        # Adjacency interact bonus (only when INTERACT and adjacency makes sense)
+        adj_bonus = 0.0
+        if (actions[0] == 5 and self._likely_adjacent(o0)): adj_bonus += self.adj_interact_bonus
+        if (actions[1] == 5 and self._likely_adjacent(o1)): adj_bonus += self.adj_interact_bonus
+
+        # Anti head-on (circuit corridor killer)
+        anti_block = self.head_on_penalty if self._is_head_on(actions[0], actions[1]) else 0.0
+
+        shaped = alpha * (progress_bonus + adj_bonus + anti_block)
+
+        # Combine with your existing built-in shaping readout (if any)
+        built_in = 0.0
+        rs = info.get("shaped_r_by_agent")
+        if rs is not None:
+            # keep small to avoid overpowering
+            built_in = 0.5 * 0.5 * (float(rs[0]) + float(rs[1]))
+
+        total_team_reward = float(sparse_R) + shaped + built_in
+
+        # Update state
+        self.prev_phi_0 = phi0
+        self.prev_phi_1 = phi1
+        self.prev_obs = obs
+        self.total_steps += 1
+
+        # Put shaped total back into env API shape: we keep team reward in R, retain info
+        return obs, total_team_reward, done, info
 
 class Actor(nn.Module):
     # Produces logits over 6 discrete actions for ONE agent
@@ -414,7 +525,109 @@ class PPOMulti:
                     list(self.actor.parameters()) + list(self.critic.parameters()), cfg.max_grad_norm
                 )
                 self.opt.step()
+class PotentialShapingWrapper(gym.Wrapper):
+    """
+    Potential-based reward shaping:
+      F(s,a,s') = gamma * Phi(s') - Phi(s) + small event bonuses/penalties.
+    Works with featurized obs vectors (96-D); no layout-specific indices required.
+    """
+    def __init__(self, env, gamma=0.99,
+                 progress_w=0.08,         # distance reduction weight per agent
+                 adj_interact_bonus=0.2,  # reward if INTERACT at adjacency
+                 head_on_penalty=-0.05,   # discourage head-on collisions in corridors
+                 anneal_steps=150_000):   # linearly anneal shaping to ~0
+        super().__init__(env)
+        self.gamma = gamma
+        self.progress_w = progress_w
+        self.adj_interact_bonus = adj_interact_bonus
+        self.head_on_penalty = head_on_penalty
+        self.anneal_steps = max(1, anneal_steps)
+        self.total_steps = 0
+        self.prev_phi_0 = 0.0
+        self.prev_phi_1 = 0.0
+        self.prev_obs = None
 
+    @staticmethod
+    def _min_nearby_manhattan(obs_vec: np.ndarray, radius_cap: int = 6) -> float:
+        """
+        Scan obs for (dx,dy) pairs. Treat small |dx|+|dy| as 'nearby station' candidates.
+        Return the minimum capped Manhattan distance we can find.
+        """
+        best = 999.0
+        v = obs_vec
+        for i in range(0, len(v)-1):
+            dx, dy = v[i], v[i+1]
+            m = abs(dx) + abs(dy)
+            if 0 < m < best and m <= radius_cap:
+                best = m
+        return best if best < 999.0 else radius_cap
+
+    @staticmethod
+    def _likely_adjacent(obs_vec: np.ndarray) -> bool:
+        v = obs_vec.astype(np.int32)
+        for i in range(0, len(v)-1):
+            dx, dy = v[i], v[i+1]
+            if (abs(dx) == 1 and dy == 0) or (abs(dy) == 1 and dx == 0):
+                return True
+        return False
+
+    @staticmethod
+    def _is_head_on(a0: int, a1: int) -> bool:
+        # 0:stay, 1:up, 2:down, 3:left, 4:right, 5:interact
+        return (a0 == 1 and a1 == 2) or (a0 == 2 and a1 == 1) or (a0 == 3 and a1 == 4) or (a0 == 4 and a1 == 3)
+
+    def reset(self, **kwargs):
+        self.prev_phi_0 = 0.0
+        self.prev_phi_1 = 0.0
+        self.prev_obs = super().reset(**kwargs)
+        return self.prev_obs
+
+    def step(self, actions):
+        obs, sparse_R, done, info = super().step(actions)
+
+        # Extract both-agent 96-D obs
+        o0, o1 = obs["both_agent_obs"]
+        # Fresh potentials (smaller is closer => we invert so larger is better)
+        d0 = self._min_nearby_manhattan(o0)
+        d1 = self._min_nearby_manhattan(o1)
+        phi0 = -d0
+        phi1 = -d1
+
+        # Anneal shaping multiplier over time to avoid breadcrumb addiction
+        alpha = max(0.0, 1.0 - (self.total_steps / float(self.anneal_steps)))
+
+        # Potential-based progress (team sum keeps it cooperative)
+        F0 = self.gamma * phi0 - self.prev_phi_0
+        F1 = self.gamma * phi1 - self.prev_phi_1
+        progress_bonus = self.progress_w * (max(0.0, F0) + max(0.0, F1))
+
+        # Adjacency interact bonus (only when INTERACT and adjacency makes sense)
+        adj_bonus = 0.0
+        if (actions[0] == 5 and self._likely_adjacent(o0)): adj_bonus += self.adj_interact_bonus
+        if (actions[1] == 5 and self._likely_adjacent(o1)): adj_bonus += self.adj_interact_bonus
+
+        # Anti head-on (circuit corridor killer)
+        anti_block = self.head_on_penalty if self._is_head_on(actions[0], actions[1]) else 0.0
+
+        shaped = alpha * (progress_bonus + adj_bonus + anti_block)
+
+        # Combine with your existing built-in shaping readout (if any)
+        built_in = 0.0
+        rs = info.get("shaped_r_by_agent")
+        if rs is not None:
+            # keep small to avoid overpowering
+            built_in = 0.5 * 0.5 * (float(rs[0]) + float(rs[1]))
+
+        total_team_reward = float(sparse_R) + shaped + built_in
+
+        # Update state
+        self.prev_phi_0 = phi0
+        self.prev_phi_1 = phi1
+        self.prev_obs = obs
+        self.total_steps += 1
+
+        # Put shaped total back into env API shape: we keep team reward in R, retain info
+        return obs, total_team_reward, done, info
 class ObsNorm:
     def __init__(self, dim, eps=1e-8):
         self.m = np.zeros(dim, np.float32)
@@ -838,24 +1051,24 @@ def sweep_layout(layout):
     ckpt = None
     return env, base_env, IS_CIRCUIT, IS_CRAMPED,IS_RING, ckpt
 
-Layouts=["counter_circuit_o_1order","cramped_room","coordination_ring"]
+Layouts=["cramped_room","coordination_ring","counter_circuit_o_1order"]
 Layouts=["counter_circuit_o_1order"]
-# results = {}
-# obsnorm_by_layout = {}
-# for layout in Layouts:
-#     print(f"layout is {layout}")
-#     env, base_env, IS_CIRCUIT, IS_CRAMPED,IS_RING, ckpt =sweep_layout(layout)
-#     norm = get_layout_norm(layout, env, obsnorm_by_layout)
-#     agent, rewards_log, soups_log = train_mappo_norm(env, norm, updates=2000, rollout_steps=2048, shaping_scale=1.0)
-#     if ckpt:
-#         agent.actor.load_state_dict(ckpt["actor"]); agent.critic.load_state_dict(ckpt["critic"])
-#     results[layout.split('_')[0]] = {"reward": rewards_log, "soups": soups_log}
-#
-# # Plot both metrics
-# plot_training_metrics(results, metric="reward",
-#                       save_dir="plots", filename="mappo_reward_norm")
-# plot_training_metrics(results, metric="soups",
-#                       save_dir="plots", filename="mappo_soups_norm")
+results = {}
+obsnorm_by_layout = {}
+for layout in Layouts:
+    print(f"layout is {layout}")
+    env, base_env, IS_CIRCUIT, IS_CRAMPED,IS_RING, ckpt =sweep_layout(layout)
+    norm = get_layout_norm(layout, env, obsnorm_by_layout)
+    agent, rewards_log, soups_log = train_mappo_norm(env, norm, updates=2000, rollout_steps=2048, shaping_scale=1.0)
+    if ckpt:
+        agent.actor.load_state_dict(ckpt["actor"]); agent.critic.load_state_dict(ckpt["critic"])
+    results[layout.split('_')[0]] = {"reward": rewards_log, "soups": soups_log}
+
+# Plot both metrics
+plot_training_metrics(results, metric="reward",
+                      save_dir="plots", filename="mappo_reward_norm")
+plot_training_metrics(results, metric="soups",
+                      save_dir="plots", filename="mappo_soups_norm")
 #
 results = {}
 for layout in Layouts:
