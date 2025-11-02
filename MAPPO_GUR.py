@@ -40,7 +40,7 @@ reward_shaping = {
     # "NEAR_POT_REWARD": 1,
     # "NEAR_ONION_REWARD": 1,
     # "NEAR_DISH_REWARD": 1,
-    "ONION_PICKUP_REW": 1,
+    "ONION_PICKUP_REWARD": 1,
     "DISH_PICKUP_REWARD": 1,
     "SOUP_PICKUP_REWARD": 5,
     "PLACEMENT_IN_POT_REW": 4,
@@ -142,68 +142,16 @@ def likely_legal_interact(feats: np.ndarray) -> bool:
 
 def mask_interact(obs0: np.ndarray, obs1: np.ndarray, a0: int, a1: int):
     """If Interact is unlikely, replace with a random move."""
+    blocked = [False, False]
     if a0 == INTERACT and not likely_legal_interact(obs0):
-        a0 = np.random.choice([1,2,3,4])   # NSEW
+        a0 = np.random.choice([1,2,3,4])
+        blocked[0] = True   # NSEW
     if a1 == INTERACT and not likely_legal_interact(obs1):
         a1 = np.random.choice([1,2,3,4])
+        blocked[1] = True
+    if blocked[0] or blocked[1]:
+        print("interact blocked:", blocked)
     return a0, a1
-
-def compute_shaped_rewards(
-    info: dict,
-    env,
-    step: int,
-    *,
-    sparse_R: float,
-    early_shape_steps: int = 50_000,
-    shape_scale_max: float = 6.0,
-    shape_scale_min: float = 1.0,
-    extra_event_bonus: float = 5.0
-):
-    """
-    Returns:
-      R_team: float        # the sparse team reward (unchanged)
-      r0_total: float      # per-agent 0: shaped component (scaled)
-      r1_total: float      # per-agent 1: shaped component (scaled)
-      shaped_hit: int      # 1 if any non-zero shaping happened on this step, else 0
-    """
-    # Scale schedule: big at start, smaller later
-    shape_scale = shape_scale_max if step < early_shape_steps else shape_scale_min
-
-    # Default no shaping
-    r0, r1 = 0.0, 0.0
-
-    # Built-in shaping from the env (e.g., onion in pot, dish pickup, soup pickup)
-    rs = info.get("shaped_r_by_agent")
-    if rs is not None:
-        # env can swap player roles; align to current index
-        if getattr(env, "agent_idx", 0):
-            # env.agent_idx == 1 means swap order
-            r0, r1 = float(rs[1]), float(rs[0])
-        else:
-            r0, r1 = float(rs[0]), float(rs[1])
-
-    # Optional: bonus for clearly attributable key events if your env surfaces them
-    # (Guarded to not crash when keys are missing.)
-    # Example keys you might add in a custom wrapper:
-    #   info["soup_plate_pickup_by_agent"] in {0,1}
-    #   info["served_by_agent"] in {0,1}
-    a_plate = info.get("soup_plate_pickup_by_agent", None)
-    if a_plate in (0, 1):
-        if a_plate == 0: r0 += extra_event_bonus
-        else:            r1 += extra_event_bonus
-
-    a_serve = info.get("served_by_agent", None)
-    if a_serve in (0, 1):
-        # small extra nudge on top of +20 sparse (don’t overpower)
-        if a_serve == 0: r0 += extra_event_bonus * 0.5
-        else:            r1 += extra_event_bonus * 0.5
-
-    # Scale shaping
-    r0_total = r0 * shape_scale
-    r1_total = r1 * shape_scale
-
-    shaped_hit = int((r0_total != 0.0) or (r1_total != 0.0))
-    return float(sparse_R), float(r0_total), float(r1_total), shaped_hit
 
 def plot_training_metrics(results_dict, metric="reward",save_dir=None, filename=None, dpi=200, fmt="png",
                           title_prefix="MAPPO training performance"):
@@ -244,17 +192,6 @@ def make_overcooked_env(layout, reward_shaping, horizon):
         return gym.make("Overcooked-v0", base_env=base, featurize_fn=base.featurize_state_mdp)
     return _init
 
-def build_vec_env(layouts, copies_per_layout=2):
-    env_fns = []
-    layout_ids = []
-    for l in layouts:
-        for _ in range(copies_per_layout):
-            env_fns.append(make_overcooked_env(l, reward_shaping, horizon))
-            layout_ids.append(l)
-    vec = AsyncVectorEnv(env_fns)
-    layout_ids = np.array(layout_ids)  # shape (N,)
-    return vec, layout_ids
-
 def get_layout_norm(layout_name: str, env, pool: dict):
     if layout_name not in pool:
         obs = env.reset()
@@ -265,66 +202,6 @@ def get_layout_norm(layout_name: str, env, pool: dict):
 def augment_obs(obs_vec, agent_idx, use_norm=False, obsnorm=None):
     agent_id = np.array([1, 0], dtype=np.float32) if agent_idx == 0 else np.array([0, 1], dtype=np.float32)
     return np.concatenate([obs_vec, agent_id], axis=-1)
-
-def load_mappo_ckpt(file,layout):
-    ckpt, path_used = None, None
-    if os.path.exists(file):
-        ckpt = torch.load(file, map_location="cpu")
-        path_used = file
-    if ckpt is None:
-        raise FileNotFoundError(f"No checkpoint found for layout={layout}. Tried: {file}")
-
-    actor_sd  = ckpt["actor"]
-    critic_sd = ckpt["critic"]
-    obsnorm = None
-    if all(k in ckpt for k in ["obsnorm_m","obsnorm_s","obsnorm_n"]):
-        m, s, n = ckpt["obsnorm_m"], ckpt["obsnorm_s"], ckpt["obsnorm_n"]
-        obsnorm = ObsNorm(dim=m.shape[0])
-        obsnorm.m, obsnorm.s, obsnorm.n = m, s, float(n)
-
-    print(f"Loaded checkpoint: {path_used} | has_norm_stats={obsnorm is not None}")
-    return actor_sd, critic_sd, obsnorm
-
-def visualization_using_existing_flow(agent,layout, use_norm=False, obsnorm=None):
-    ae = AgentEvaluator.from_layout_name({"layout_name": layout}, {"horizon": horizon})
-    featurize_fn = ae.env.featurize_state_mdp
-
-    actor_sd, critic_sd, obsnorm = load_mappo_ckpt(layout)
-    agent.actor.load_state_dict(actor_sd)
-    agent.critic.load_state_dict(critic_sd)
-    class VizPolicy(NNPolicy):
-        def __init__(self, actor, featurize_fn, use_norm=False, obsnorm=None):
-            super().__init__()
-            self.actor = actor.eval()
-            self.featurize_fn = featurize_fn
-            self.use_norm = use_norm
-            self.obsnorm = obsnorm
-
-        def state_policy(self, state, agent_index):
-            feats = self.featurize_fn(state)[agent_index]  # 96
-            if self.use_norm and self.obsnorm is not None:
-                feats = self.obsnorm.apply(feats)
-            feats = augment_obs(feats, agent_index)
-            x = torch.as_tensor(feats, dtype=torch.float32, device=device).unsqueeze(0)
-            with torch.no_grad():
-                logits = self.actor(x).squeeze(0).cpu().numpy()
-            probs = np.exp(logits - logits.max());
-            probs /= (probs.sum() + 1e-8)
-            return probs
-
-        def multi_state_policy(self, states, agent_indices):
-            return [self.state_policy(s, i) for s, i in zip(states, agent_indices)]
-
-    policy0 = StudentPolicy(agent.actor)
-    policy1 = StudentPolicy(agent.actor)
-    agent_pair = AgentPair(AgentFromPolicy(policy0), AgentFromPolicy(policy1))
-
-    trajs = ae.evaluate_agent_pair(agent_pair, num_games=1)
-    print("len(trajs):", len(trajs))
-    img_dir = f"imgs/{layout}/"
-    ipython_display = True
-    StateVisualizer().display_rendered_trajectory(trajs, img_directory_path=img_dir, ipython_display=ipython_display)
-
 
 class Actor(nn.Module):
     """
@@ -406,37 +283,21 @@ class PPOMulti:
     def value(self, joint_np):
         j = torch.as_tensor(joint_np, dtype=torch.float32, device=device)
         return self.critic(j).cpu().numpy()
-
+    def unroll_masked(actor, obs_seq, h_init, mask_seq):
+        # obs_seq: [1, T, D], mask_seq: [1, T] with 1.0 alive, 0.0 = episode start at this step
+        B, T, D = obs_seq.shape
+        h = h_init
+        logits_list = []
+        for t in range(T):
+            # if this step is the FIRST step of an episode, zero hidden
+            reset = (mask_seq[:, t:t + 1] == 0.0).float()  # [1,1]
+            # h <- h * (1 - reset) + 0 * reset
+            h = h * (1.0 - reset)
+            out, h = actor.rnn(actor.inp(obs_seq[:, t:t + 1, :]).contiguous(), h)
+            logits_t = actor.head(out)  # [1,1,A]
+            logits_list.append(logits_t)
+        return torch.cat(logits_list, dim=1), h
     def update(self, batch):
-        # cfg = self.cfg
-        # obs  = torch.tensor(batch["obs"],  dtype=torch.float32, device=device)
-        # act  = torch.tensor(batch["act"],  dtype=torch.int64,   device=device)
-        # adv  = torch.tensor(batch["adv"],  dtype=torch.float32, device=device)
-        # ret  = torch.tensor(batch["ret"],  dtype=torch.float32, device=device)
-        # lpo  = torch.tensor(batch["logp"], dtype=torch.float32, device=device)
-        # jobs = torch.tensor(batch["joint_obs"], dtype=torch.float32, device=device)
-        #
-        # n = obs.shape[0]
-        # idx = np.arange(n)
-        # for _ in range(cfg.opt_iters):
-        #     np.random.shuffle(idx)
-        #     for s in range(0, n, cfg.minibatch_size):
-        #         mb = idx[s:s+cfg.minibatch_size]
-        #         d = self.dist(self.actor(obs[mb]))
-        #         logp = d.log_prob(act[mb])
-        #         ratio = torch.exp(logp - lpo[mb])
-        #         clipped = torch.clamp(ratio, 1-cfg.clip, 1+cfg.clip) * adv[mb]
-        #         pi_loss = -(torch.min(ratio*adv[mb], clipped).mean() + cfg.ent_coef*d.entropy().mean())
-        #
-        #         v = self.critic(jobs[mb])
-        #         v_loss = cfg.vf_coef * F.mse_loss(v, ret[mb])
-        #
-        #         self.opt.zero_grad()
-        #         (pi_loss + v_loss).backward()
-        #         nn.utils.clip_grad_norm_(
-        #             list(self.actor.parameters()) + list(self.critic.parameters()), cfg.max_grad_norm
-        #         )
-        #         self.opt.step()
         """
                 batch:
                   obs0, obs1: [T, obs_dim]
@@ -471,8 +332,10 @@ class PPOMulti:
         h0_1 = to_t(batch["h0_1"])
 
         # Forward RNN in one go; zero-out loss across episode boundaries via masks
-        logits0, _ = self.actor(obs0, h0_0)  # [1,T,A]
-        logits1, _ = self.actor(obs1, h0_1)
+
+
+        logits0, _ = self.unroll_masked(self.actor, obs0, h0_0, masks)
+        logits1, _ = self.unroll_masked(self.actor, obs1, h0_1, masks)
 
         d0 = self.dist(logits0.squeeze(0))  # [T,A]
         d1 = self.dist(logits1.squeeze(0))
@@ -524,7 +387,7 @@ class ObsNorm:
         var = np.clip(self.s / max(self.n-1, 1), 1e-3, 1e9)
         return (x - self.m) / np.sqrt(var)
 def visulize(agent, ae, layout, horizon=400, use_norm=False, obsnorm=None,
-             img_root="imgs/GUR", ipython_display=False):
+             img_root="imgs", ipython_display=False):
     # Build evaluator for this layout to get the correct featurizer
     featurize_fn = ae.env.featurize_state_mdp  # do NOT use global base_env
 
@@ -606,6 +469,8 @@ def build_batch_from_time_steps(step_obs0, step_obs1,
         "obs": obs, "act": act, "logp": logp,
         "adv": adv_b, "ret": ret_b, "joint_obs": joint
     }
+
+
 def train_mappo(env, updates=2000, rollout_steps=2048, shaping_scale=1.0):
     hid = 128
     h0 = np.zeros((1, 1, hid), dtype=np.float32)  # agent 0 hidden
@@ -624,7 +489,6 @@ def train_mappo(env, updates=2000, rollout_steps=2048, shaping_scale=1.0):
 
     best_soups = -1.0
     rewards_log, soups_log = [], []
-    ae = AgentEvaluator.from_layout_name({"layout_name": layout}, {"horizon": horizon})
     for upd in range(1, agent.cfg.total_updates + 1):
         # simple entropy schedule (optional but helps)
         if upd <= int(0.3 * agent.cfg.total_updates):
@@ -657,7 +521,7 @@ def train_mappo(env, updates=2000, rollout_steps=2048, shaping_scale=1.0):
             #     a0 = int(dist0.sample().item())
             #     a1 = int(dist1.sample().item())
 
-            if upd <= 50 and np.random.rand() < 0.1:
+            if upd <= 300 and np.random.rand() < 0.7:
                 a0_exec, a1_exec = mask_interact(o0, o1, a0, a1)
                 a0_exec, a1_exec = maybe_bias_actions(steps, upd, a0_exec, a1_exec, o0, o1)
             else:
@@ -748,7 +612,6 @@ def train_mappo(env, updates=2000, rollout_steps=2048, shaping_scale=1.0):
         agent.update(batch)
 
         if upd % 10 == 0:
-            visulize(agent, ae, layout)
             mean_ret, mean_soups = eval_soups(agent, env, episodes=30)
             rewards_log.append(mean_ret)
             soups_log.append(mean_soups)
@@ -782,7 +645,6 @@ def train_mappo_norm(env,  obsnorm, updates=2000, rollout_steps=2048, shaping_sc
 
     best_soups = -1.0
     rewards_log, soups_log = [], []
-    ae = AgentEvaluator.from_layout_name({"layout_name": layout}, {"horizon": horizon})
     for upd in range(1, agent.cfg.total_updates + 1):
         # # simple entropy schedule (optional but helps)
         # if upd <= int(0.3 * agent.cfg.total_updates):
@@ -813,7 +675,7 @@ def train_mappo_norm(env,  obsnorm, updates=2000, rollout_steps=2048, shaping_sc
             a1, lp1_samp, h1, logits1 = agent.act(o1_aug, h1)
 
 
-            if upd <= 50 and np.random.rand() < 0.1:
+            if upd <= 300 and np.random.rand() < 0.7:
                 a0_exec, a1_exec = mask_interact(o0, o1, a0, a1)
                 a0_exec, a1_exec = maybe_bias_actions(steps, upd, a0_exec, a1_exec, o0, o1)
             else:
@@ -829,11 +691,7 @@ def train_mappo_norm(env,  obsnorm, updates=2000, rollout_steps=2048, shaping_sc
 
             # step env
             obs, R, done, info = env.step([a0e, a1e])
-            # if "shaped_info_by_agent" in info:
-            #     print("shaped_info_by_agent:", info["shaped_info_by_agent"])
-            # elif "shaped_r_by_agent" in info:
-            #     print("shaped_r_by_agent:", info["shaped_r_by_agent"])
-            # print("info keys:", info.keys())
+
             # sparse + mild shaped reward
             shape_scale = 8.0 if upd <= 200 else agent.cfg.shaping_scale
             r = float(R) + shaped_team_reward(info, env, scale=shape_scale)
@@ -899,7 +757,7 @@ def train_mappo_norm(env,  obsnorm, updates=2000, rollout_steps=2048, shaping_sc
         agent.update(batch)
 
         if upd % 10 == 0:
-            visulize(agent, ae, layout)
+            #visulize(agent, ae, layout)
             mean_ret, mean_soups = eval_soups_norm(agent, env, obsnorm,episodes=30)
             rewards_log.append(mean_ret)
             soups_log.append(mean_soups)
@@ -943,8 +801,8 @@ def eval_soups(agent, env, episodes=20, hid=128):
             logits1, h1_next = agent.actor(x1, h1_t)
 
             # Stochastic eval to match your agent.act() behavior
-            a0 = int(torch.argmax(logits0[0, -1]).item())
-            a1 = int(torch.argmax(logits1[0, -1]).item())
+            a0 = int(torch.distributions.Categorical(logits=logits0[0, -1]).sample().item())
+            a1 = int(torch.distributions.Categorical(logits=logits1[0, -1]).sample().item())
 
             # Optional hygiene consistent with training
             a0, a1 = mask_interact(o0, o1, a0, a1)
@@ -983,8 +841,9 @@ def eval_soups_norm(agent, env, obsnorm, episodes=20, hid=128):
             logits0, h0_next = agent.actor(x0, h0_t)   # logits0: [1, 1, A]
             logits1, h1_next = agent.actor(x1, h1_t)
 
-            a0 = int(torch.argmax(logits0[0, -1]).item())
-            a1 = int(torch.argmax(logits1[0, -1]).item())
+            a0 = int(torch.distributions.Categorical(logits=logits0[0, -1]).sample().item())
+            a1 = int(torch.distributions.Categorical(logits=logits1[0, -1]).sample().item())
+
 
 
             a0, a1 = mask_interact(o0, o1, a0, a1)
@@ -1042,7 +901,7 @@ def sweep_layout(layout):
     IS_CIRCUIT = (layout == "counter_circuit_o_1order")
     # Build the environment.  Do not modify!
     mdp = OvercookedGridworld.from_layout_name(layout, rew_shaping_params=reward_shaping)
-    base_env = OvercookedEnv.from_mdp(mdp, horizon=horizon, info_level=0)
+    base_env = OvercookedEnv.from_mdp(mdp, horizon=horizon, info_level=1)
     env = gym.make("Overcooked-v0", base_env=base_env, featurize_fn=base_env.featurize_state_mdp)
     ckpt = None
     return env, base_env, IS_CIRCUIT, IS_CRAMPED,IS_RING, ckpt
