@@ -39,17 +39,18 @@ from gym.vector import AsyncVectorEnv
 ## in lieu of, or in addition to, using this structure. The shaped rewards
 ## provided by this structure will appear in a different place (see below)
 reward_shaping = {
-    "NEAR_POT_REWARD": 1,
-    "ONION_PICKUP_REW": 2,
-    "NEAR_DISH_REWARD": 1,
-    "PLACEMENT_IN_POT_REW": 4,
-    "DISH_PICKUP_REWARD": 3,
+    # "NEAR_POT_REWARD": 1,
+    # "NEAR_ONION_REWARD": 1,
+    # "NEAR_DISH_REWARD": 1,
+    "ONION_PICKUP_REW": 1,
+    "DISH_PICKUP_REWARD": 1,
     "SOUP_PICKUP_REWARD": 5,
+    "PLACEMENT_IN_POT_REW": 4,
+    "SOUP_DELIVERY_REWARD_SHAPING":5,
     "PICKUP_WRONG_OBJ_PEN":-1,
-    "DROP_OBJ_PENALTY":-1,
-    "USEFUL_INTERACT_REWARD": 1,     # if supported
-    "INVALID_INTERACT_PENALTY": -2,  # if supported
-    "STEP_COST": 0                   # if supported
+    "USEFUL_INTERACT_REWARD": 2,
+    "INVALID_INTERACT_PENALTY": -2,
+    "STEP_COST": 0
 }
 
 # Length of Episodes.  Do not modify for your submission!
@@ -286,45 +287,13 @@ def load_mappo_ckpt(file,layout):
     print(f"Loaded checkpoint: {path_used} | has_norm_stats={obsnorm is not None}")
     return actor_sd, critic_sd, obsnorm
 
-def visualization_using_existing_flow(agent,layout, use_norm=False, obsnorm=None):
+def visualization_using_existing_flow(agent,layout):
     ae = AgentEvaluator.from_layout_name({"layout_name": layout}, {"horizon": horizon})
     featurize_fn = ae.env.featurize_state_mdp
 
     actor_sd, critic_sd, obsnorm = load_mappo_ckpt(layout)
     agent.actor.load_state_dict(actor_sd)
     agent.critic.load_state_dict(critic_sd)
-    class VizPolicy(NNPolicy):
-        def __init__(self, actor, featurize_fn, use_norm=False, obsnorm=None):
-            super().__init__()
-            self.actor = actor.eval()
-            self.featurize_fn = featurize_fn
-            self.use_norm = use_norm
-            self.obsnorm = obsnorm
-
-        def state_policy(self, state, agent_index):
-            feats = self.featurize_fn(state)[agent_index]  # 96
-            if self.use_norm and self.obsnorm is not None:
-                feats = self.obsnorm.apply(feats)
-            feats = augment_obs(feats, agent_index)
-            x = torch.as_tensor(feats, dtype=torch.float32, device=device).unsqueeze(0)
-            with torch.no_grad():
-                logits = self.actor(x).squeeze(0).cpu().numpy()
-            probs = np.exp(logits - logits.max());
-            probs /= (probs.sum() + 1e-8)
-            return probs
-
-        def multi_state_policy(self, states, agent_indices):
-            return [self.state_policy(s, i) for s, i in zip(states, agent_indices)]
-
-    policy0 = StudentPolicy(agent.actor)
-    policy1 = StudentPolicy(agent.actor)
-    agent_pair = AgentPair(AgentFromPolicy(policy0), AgentFromPolicy(policy1))
-
-    trajs = ae.evaluate_agent_pair(agent_pair, num_games=1)
-    print("len(trajs):", len(trajs))
-    img_dir = f"imgs/{layout}/"
-    ipython_display = True
-    StateVisualizer().display_rendered_trajectory(trajs, img_directory_path=img_dir, ipython_display=ipython_display)
 
 class PotentialShapingWrapper(gym.Wrapper):
     """
@@ -657,7 +626,6 @@ def compute_adv_ret_from_time_steps(rews, vals, dones, gamma=0.99, lam=0.95):
         gae = deltas[t] + gamma * lam * next_mask[t] * gae
         adv[t] = gae
     ret = adv + vals
-    # 标准化优势（按时间步）
     adv = (adv - adv.mean()) / (adv.std() + 1e-8)
     return adv, ret
 
@@ -808,6 +776,7 @@ def train_mappo(env, updates=2000, rollout_steps=2048, shaping_scale=1.0):
 def train_mappo_norm(env,  obsnorm, updates=2000, rollout_steps=2048, shaping_scale=1.0):
     # Probe dims
     obs = env.reset()
+    #print("shaping keys:", env.unwrapped.base_env.mdp.reward_shaping_params)
     o0, o1 = get_obs_pair(obs)
     obs_dim = o0.shape[0]; act_dim = env.action_space.n
 
@@ -817,6 +786,7 @@ def train_mappo_norm(env,  obsnorm, updates=2000, rollout_steps=2048, shaping_sc
 
     best_soups = -1.0
     rewards_log, soups_log = [], []
+    ae = AgentEvaluator.from_layout_name({"layout_name": layout}, {"horizon": horizon})
     for upd in range(1, agent.cfg.total_updates + 1):
         # # simple entropy schedule (optional but helps)
         # if upd <= int(0.3 * agent.cfg.total_updates):
@@ -863,7 +833,7 @@ def train_mappo_norm(env,  obsnorm, updates=2000, rollout_steps=2048, shaping_sc
 
             # step env
             obs, R, done, info = env.step([a0e, a1e])
-
+            #print("sparse R =", R, "| shaped =", info.get("shaped_r_by_agent"))
             # sparse + mild shaped reward
             shape_scale = 8.0 if upd <= 200 else agent.cfg.shaping_scale
             r = float(R) + shaped_team_reward(info, env, scale=shape_scale)
@@ -919,6 +889,7 @@ def train_mappo_norm(env,  obsnorm, updates=2000, rollout_steps=2048, shaping_sc
         agent.update(batch)
 
         if upd % 10 == 0:
+            visulize(agent,ae, layout)
             mean_ret, mean_soups = eval_soups_norm(agent, env, obsnorm,episodes=30)
             rewards_log.append(mean_ret)
             soups_log.append(mean_soups)
@@ -1016,28 +987,50 @@ def eval_soups_norm(agent, env, obsnorm, episodes=20):
 # The below code is a partcular way to rollout episodes in a format
 # compatible with the built-in state visualizer.
 # ====== Policy wrapper compatible with AgentEvaluator/StateVisualizer ======
-class StudentPolicy(NNPolicy):
-    """
-    Wraps the trained shared actor. state_policy must return a probability vector
-    over 6 actions for the requested agent index.
-    """
-    def __init__(self, actor: Actor):
-        super().__init__()
-        self.actor = actor.eval()  # inference mode
+def visulize(agent, ae, layout, horizon=400, use_norm=False, obsnorm=None,
+             img_root="imgs", ipython_display=False):
+    # Build evaluator for this layout to get the correct featurizer
+    featurize_fn = ae.env.featurize_state_mdp  # do NOT use global base_env
 
-    def state_policy(self, state, agent_index):
-        # base_env.featurize_state_mdp gives features for both; we only need the one for agent_index
-        feats = base_env.featurize_state_mdp(state)[agent_index]
-        x = torch.as_tensor(feats, dtype=torch.float32, device=device).unsqueeze(0)
-        with torch.no_grad():
-            logits = self.actor(x).squeeze(0).cpu().numpy()
-        # Convert logits to a valid probability simplex for the visualizer
-        probs = np.exp(logits - logits.max())
-        probs /= probs.sum() + 1e-8
-        return probs
+    class StudentPolicy(NNPolicy):
+        """
+        Wraps the trained shared actor. Returns a probability vector over 6 actions.
+        """
+        def __init__(self, actor: Actor):
+            super().__init__()
+            self.actor = actor.eval()  # inference mode
 
-    def multi_state_policy(self, states, agent_indices):
-        return [self.state_policy(s, i) for s, i in zip(states, agent_indices)]
+        def state_policy(self, state, agent_index):
+            # 1) 96-D features from the evaluator env
+            feats = featurize_fn(state)[agent_index]
+            # 2) If you trained with normalization, apply it here
+            if use_norm and (obsnorm is not None):
+                feats = obsnorm.apply(feats)
+            # 3) Append the 2-D agent one-hot used in training → 98-D
+            feats = augment_obs(feats, agent_index)
+
+            x = torch.as_tensor(feats, dtype=torch.float32, device=device).unsqueeze(0)
+            assert x.shape[-1] == agent.actor.body[0].in_features, \
+                f"Feature dim mismatch: got {x.shape[-1]}, expected {agent.actor.body[0].in_features}"
+            with torch.no_grad():
+                logits = agent.actor(x).squeeze(0).cpu().numpy()
+            probs = np.exp(logits - logits.max()); probs /= (probs.sum() + 1e-8)
+            return probs
+
+        def multi_state_policy(self, states, agent_indices):
+            return [self.state_policy(s, i) for s, i in zip(states, agent_indices)]
+
+    policy0 = StudentPolicy(agent.actor)
+    policy1 = StudentPolicy(agent.actor)
+    pair = AgentPair(AgentFromPolicy(policy0), AgentFromPolicy(policy1))
+
+    trajs = ae.evaluate_agent_pair(pair, num_games=1)
+    out_dir = os.path.join(img_root, layout)
+    os.makedirs(out_dir, exist_ok=True)
+    StateVisualizer().display_rendered_trajectory(
+        trajs, img_directory_path=out_dir, ipython_display=ipython_display
+    )
+    print("len(trajs):", len(trajs), "| saved to:", out_dir)
 
 # ====== Train MAPPO ======
 def sweep_layout(layout):
