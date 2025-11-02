@@ -114,13 +114,13 @@ def maybe_bias_moves(step, a0, a1, o0, o1):
         a1 = heuristic_nudge(o1) if np.random.rand() < 0.6 else a1
     return a0, a1
 INTERACT = 5
-def mask_interact(obs0: np.ndarray, obs1: np.ndarray, a0: int, a1: int):
-    """If Interact is unlikely, replace with a random move."""
-    if a0 == INTERACT and not likely_legal_interact(obs0):
-        a0 = np.random.choice([1,2,3,4])   # NSEW
-    if a1 == INTERACT and not likely_legal_interact(obs1):
-        a1 = np.random.choice([1,2,3,4])
-    return int(a0), int(a1)
+def mask_interact(obs0, obs1, a0, a1):
+    def remap(a, obs):
+        if a == INTERACT and not likely_legal_interact(obs):
+            # try a nudge first
+            return heuristic_nudge(obs)
+        return a
+    return int(remap(a0, obs0)), int(remap(a1, obs1))
 
 def compute_shaped_rewards(
     info: dict,
@@ -128,8 +128,8 @@ def compute_shaped_rewards(
     step: int,
     *,
     sparse_R: float,
-    early_shape_steps: int = 50_000,
-    shape_scale_max: float = 6.0,
+    early_shape_steps: int = 10_000,
+    shape_scale_max: float = 3.0,
     shape_scale_min: float = 1.0,
     extra_event_bonus: float = 5.0
 ):
@@ -299,18 +299,24 @@ class QMIX:
         self.eps_decay = 5e-3  # tune if needed
 
     def act_pair(self, o0, o1):
-        # ε-greedy per agent
-        a = []
-        for o in [o0, o1]:
-            if np.random.rand() < self.eps:
-                a.append(np.random.randint(self.act_dim))
-            else:
-                with torch.no_grad():
-                    q0 = self.q(torch.as_tensor(o0[None, :], dtype=torch.float32, device=device), self.role0)
-                    q1 = self.q(torch.as_tensor(o1[None, :], dtype=torch.float32, device=device), self.role1)
-                    a.append(int(q0.argmax(1).item()));
-                    a.append(int(q1.argmax(1).item()))
-        return a[0], a[1]
+        # ε-greedy per agent (no duplication, correct roles)
+        if np.random.rand() < self.eps:
+            a0 = np.random.randint(self.act_dim)
+        else:
+            with torch.no_grad():
+                q0 = self.q(torch.as_tensor(o0[None, :], dtype=torch.float32, device=device),
+                            torch.zeros(1, dtype=torch.long, device=device))
+                a0 = int(q0.argmax(1).item())
+
+        if np.random.rand() < self.eps:
+            a1 = np.random.randint(self.act_dim)
+        else:
+            with torch.no_grad():
+                q1 = self.q(torch.as_tensor(o1[None, :], dtype=torch.float32, device=device),
+                            torch.ones(1, dtype=torch.long, device=device))
+                a1 = int(q1.argmax(1).item())
+
+        return a0, a1
 
     def soft_update(self, net, tgt):
         for p, tp in zip(net.parameters(), tgt.parameters()):
@@ -429,7 +435,8 @@ def train_qmix(
 
         # book-keeping for logs
         hits += shaped_hit
-
+        interacts += int(a0 == INTERACT) + int(a1 == INTERACT)
+        adj += int(likely_legal_interact(o0)) + int(likely_legal_interact(o1))
         # advance
         o0, o1 = o0n, o1n
         if done:
