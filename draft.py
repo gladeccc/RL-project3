@@ -37,18 +37,17 @@ from gym.vector import AsyncVectorEnv
 ## in lieu of, or in addition to, using this structure. The shaped rewards
 ## provided by this structure will appear in a different place (see below)
 reward_shaping = {
-    # "NEAR_POT_REWARD": 1,
-    # "NEAR_ONION_REWARD": 1,
-    # "NEAR_DISH_REWARD": 1,
-    "ONION_PICKUP_REW": 1,
-    "DISH_PICKUP_REWARD": 1,
-    "SOUP_PICKUP_REWARD": 5,
+    "NEAR_POT_REWARD": 1,
+    "ONION_PICKUP_REW": 2,
+    "NEAR_DISH_REWARD": 1,
     "PLACEMENT_IN_POT_REW": 4,
-    "SOUP_DELIVERY_REWARD_SHAPING":5,
+    "DISH_PICKUP_REWARD": 3,
+    "SOUP_PICKUP_REWARD": 5,
     "PICKUP_WRONG_OBJ_PEN":-1,
-    "USEFUL_INTERACT_REWARD": 2,
-    "INVALID_INTERACT_PENALTY": -2,
-    "STEP_COST": 0
+    "DROP_OBJ_PENALTY":-1,
+    "USEFUL_INTERACT_REWARD": 1,     # if supported
+    "INVALID_INTERACT_PENALTY": -2,  # if supported
+    "STEP_COST": 0                   # if supported
 }
 
 # Length of Episodes.  Do not modify for your submission!
@@ -240,7 +239,6 @@ def plot_training_metrics(results_dict, metric="reward",save_dir=None, filename=
 def make_overcooked_env(layout, reward_shaping, horizon):
     def _init():
         mdp = OvercookedGridworld.from_layout_name(layout, rew_shaping_params=reward_shaping)
-        print(mdp.rew_shaping_params)
         base = OvercookedEnv.from_mdp(mdp, horizon=horizon, info_level=0)
         return gym.make("Overcooked-v0", base_env=base, featurize_fn=base.featurize_state_mdp)
     return _init
@@ -389,24 +387,6 @@ class PPOMulti:
             list(self.actor.parameters()) + list(self.critic.parameters()), lr=cfg.lr
         )
 
-    def rnn_forward_with_masks(actor, obs_seq, h0, masks):
-        """
-        obs_seq: [1, T, D]
-        h0:      [1, 1, H]
-        masks:   [1, T]  (1=延续同一回合, 0=新回合第一步)
-        return:  logits [1, T, A]
-        """
-        B, T, D = obs_seq.shape
-        h = h0
-        logits_list = []
-        for t in range(T):
-            m_t = masks[:, t].view(1, 1, 1)  # [1,1,1]
-            h = h * m_t
-            x_t = obs_seq[:, t:t + 1, :]  # [1,1,D]
-            logit_t, h = actor(x_t, h)
-            logits_list.append(logit_t)  # [1,1,A]
-        return torch.cat(logits_list, dim=1)  # [1,T,A]
-
     def dist(self, logits):
         return torch.distributions.Categorical(logits=logits)
 
@@ -427,121 +407,101 @@ class PPOMulti:
         return self.critic(j).cpu().numpy()
 
     def update(self, batch):
-        # ---- helpers ----
-        def to_t(x, dtype=torch.float32):
-            return torch.as_tensor(x, dtype=dtype, device=device)
+        # cfg = self.cfg
+        # obs  = torch.tensor(batch["obs"],  dtype=torch.float32, device=device)
+        # act  = torch.tensor(batch["act"],  dtype=torch.int64,   device=device)
+        # adv  = torch.tensor(batch["adv"],  dtype=torch.float32, device=device)
+        # ret  = torch.tensor(batch["ret"],  dtype=torch.float32, device=device)
+        # lpo  = torch.tensor(batch["logp"], dtype=torch.float32, device=device)
+        # jobs = torch.tensor(batch["joint_obs"], dtype=torch.float32, device=device)
+        #
+        # n = obs.shape[0]
+        # idx = np.arange(n)
+        # for _ in range(cfg.opt_iters):
+        #     np.random.shuffle(idx)
+        #     for s in range(0, n, cfg.minibatch_size):
+        #         mb = idx[s:s+cfg.minibatch_size]
+        #         d = self.dist(self.actor(obs[mb]))
+        #         logp = d.log_prob(act[mb])
+        #         ratio = torch.exp(logp - lpo[mb])
+        #         clipped = torch.clamp(ratio, 1-cfg.clip, 1+cfg.clip) * adv[mb]
+        #         pi_loss = -(torch.min(ratio*adv[mb], clipped).mean() + cfg.ent_coef*d.entropy().mean())
+        #
+        #         v = self.critic(jobs[mb])
+        #         v_loss = cfg.vf_coef * F.mse_loss(v, ret[mb])
+        #
+        #         self.opt.zero_grad()
+        #         (pi_loss + v_loss).backward()
+        #         nn.utils.clip_grad_norm_(
+        #             list(self.actor.parameters()) + list(self.critic.parameters()), cfg.max_grad_norm
+        #         )
+        #         self.opt.step()
+        """
+                batch:
+                  obs0, obs1: [T, obs_dim]
+                  act0, act1: [T], logp0, logp1: [T]
+                  h0_0, h0_1: [1,1,hid] initial hidden for each agent’s sequence start
+                  adv, ret:   [T] (time-step), will be broadcast internally
+                  joint:      [T, 2*obs_dim]
+                  masks:      [T] (1-alive, 0-episode-boundary) for RNN state reset
+                We do truncated BPTT over the whole rollout (single env), honoring masks.
+                """
+        cfg = self.cfg
 
-        def rnn_forward_with_masks(actor, obs_seq, h0, masks):
-            """
-            obs_seq: [1, T, D]
-            h0:      [1, 1, H]
-            masks:   [1, T]  (1=同一回合延续, 0=新回合第一步)
-            return:  logits [1, T, A]
-            """
-            B, T, D = obs_seq.shape
-            h = h0
-            outs = []
-            for t in range(T):
-                m_t = masks[:, t].view(1, 1, 1)  # [1,1,1]
-                h = h * m_t  # 在新回合清零隐藏态
-                x_t = obs_seq[:, t:t + 1, :]  # [1,1,D]
-                logit_t, h = actor(x_t, h)  # GRU 前向
-                outs.append(logit_t)  # [1,1,A]
-            return torch.cat(outs, dim=1)  # [1,T,A]
+        # Build tensors
+        def to_t(x, dtype=torch.float32): return torch.as_tensor(x, dtype=dtype, device=device)
 
-        # ---- build tensors ----
         T = batch["obs0"].shape[0]
-        obs0 = to_t(batch["obs0"]).unsqueeze(0)  # [1,T,D]
+
+        # Pack per-agent sequences to shape [B=1, T, D]
+        obs0 = to_t(batch["obs0"]).unsqueeze(0)
         obs1 = to_t(batch["obs1"]).unsqueeze(0)
-        act0 = to_t(batch["act0"], torch.int64).unsqueeze(0)  # [1,T]
+        act0 = to_t(batch["act0"], torch.int64).unsqueeze(0)
         act1 = to_t(batch["act1"], torch.int64).unsqueeze(0)
-        old0 = to_t(batch["logp0"]).unsqueeze(0)  # [1,T]
+        old0 = to_t(batch["logp0"]).unsqueeze(0)
         old1 = to_t(batch["logp1"]).unsqueeze(0)
+
         adv = to_t(batch["adv"]).unsqueeze(0)  # [1,T]
         ret = to_t(batch["ret"]).unsqueeze(0)  # [1,T]
-        jobs = to_t(batch["joint"])  # [T,2D]
+        jobs = to_t(batch["joint"])  # [T, 2*obs_dim]
         masks = to_t(batch["mask"]).unsqueeze(0)  # [1,T]
+
         h0_0 = to_t(batch["h0_0"])  # [1,1,H]
         h0_1 = to_t(batch["h0_1"])
 
-        # ---- RNN forward with per-step mask resets ----
-        logits0 = rnn_forward_with_masks(self.actor, obs0, h0_0, masks)  # [1,T,A]
-        logits1 = rnn_forward_with_masks(self.actor, obs1, h0_1, masks)
+        # Forward RNN in one go; zero-out loss across episode boundaries via masks
+        logits0, _ = self.actor(obs0, h0_0)  # [1,T,A]
+        logits1, _ = self.actor(obs1, h0_1)
 
-        d0 = torch.distributions.Categorical(logits=logits0.squeeze(0))  # [T,A]
-        d1 = torch.distributions.Categorical(logits=logits1.squeeze(0))
+        d0 = self.dist(logits0.squeeze(0))  # [T,A]
+        d1 = self.dist(logits1.squeeze(0))
 
         logp0 = d0.log_prob(act0.squeeze(0))  # [T]
-        logp1 = d1.log_prob(act1.squeeze(0))  # [T]
+        logp1 = d1.log_prob(act1.squeeze(0))
 
         ratio0 = torch.exp(logp0 - old0.squeeze(0))
         ratio1 = torch.exp(logp1 - old1.squeeze(0))
 
-        m = masks.squeeze(0)  # [T]
-        adv0 = adv.squeeze(0) * m
-        adv1 = adv.squeeze(0) * m
+        # Broadcast advantages to per-agent; apply masks to stop gradients across episode cuts
+        adv0 = adv.squeeze(0) * masks.squeeze(0)
+        adv1 = adv.squeeze(0) * masks.squeeze(0)
 
-        clip = self.cfg.clip
-        pi_loss0 = -torch.mean(torch.min(ratio0 * adv0,
-                                         torch.clamp(ratio0, 1 - clip, 1 + clip) * adv0))
-        pi_loss1 = -torch.mean(torch.min(ratio1 * adv1,
-                                         torch.clamp(ratio1, 1 - clip, 1 + clip) * adv1))
+        clip = cfg.clip
+        pi_loss0 = -torch.mean(torch.min(ratio0 * adv0, torch.clamp(ratio0, 1 - clip, 1 + clip) * adv0))
+        pi_loss1 = -torch.mean(torch.min(ratio1 * adv1, torch.clamp(ratio1, 1 - clip, 1 + clip) * adv1))
         ent = torch.mean(d0.entropy() + d1.entropy())
 
         v = self.critic(jobs)  # [T]
-        v_loss = self.cfg.vf_coef * F.mse_loss(v * m, ret.squeeze(0) * m)
+        v_loss = cfg.vf_coef * F.mse_loss(v, ret.squeeze(0))
 
-        pi_loss = pi_loss0 + pi_loss1 - self.cfg.ent_coef * ent
+        pi_loss = pi_loss0 + pi_loss1 - cfg.ent_coef * ent
 
         self.opt.zero_grad()
         (pi_loss + v_loss).backward()
         nn.utils.clip_grad_norm_(list(self.actor.parameters()) + list(self.critic.parameters()),
-                                 self.cfg.max_grad_norm)
+                                 cfg.max_grad_norm)
         self.opt.step()
-class MinimalRNNPolicy:
-    """
-    A minimal policy wrapper for Overcooked's AgentFromPolicy.
-    - No inheritance from NNPolicy (avoids .body/.head expectations).
-    - Keeps a per-agent GRU hidden state across calls.
-    - Accepts optional obsnorm and augment_obs usage.
-    """
-    def __init__(self, actor: Actor, featurize_fn, use_norm=False, obsnorm=None, device="cpu"):
-        self.actor = actor.eval()
-        self.featurize_fn = featurize_fn
-        self.use_norm = use_norm
-        self.obsnorm = obsnorm
-        self.device = device
-        self.h = {}  # maps agent_index -> np.array([1,1,H])
 
-    def _ensure_h(self, agent_index: int, hid_size: int):
-        if agent_index not in self.h:
-            self.h[agent_index] = np.zeros((1, 1, hid_size), np.float32)
-
-    def state_policy(self, state, agent_index):
-        # 1) featurize
-        feats = self.featurize_fn(state)[agent_index]        # shape [obs_dim]
-        if self.use_norm and self.obsnorm is not None:
-            feats = self.obsnorm.apply(feats)
-        feats = augment_obs(feats, agent_index)              # +2 agent id
-
-        # 2) forward through your GRU actor with persistent hidden state
-        hid_size = self.actor.rnn.hidden_size
-        self._ensure_h(agent_index, hid_size)
-
-        x = torch.as_tensor(feats, dtype=torch.float32, device=self.device).view(1, 1, -1)
-        h0 = torch.as_tensor(self.h[agent_index], dtype=torch.float32, device=self.device)
-        with torch.no_grad():
-            logits, hT = self.actor(x, h0)                   # [1,1,A], [1,1,H]
-        self.h[agent_index] = hT.cpu().numpy()
-
-        # 3) return probabilities
-        logits = logits.squeeze(0).squeeze(0).cpu().numpy()
-        probs = np.exp(logits - logits.max())
-        probs /= probs.sum() + 1e-8
-        return probs
-
-    def multi_state_policy(self, states, agent_indices):
-        return [self.state_policy(s, i) for s, i in zip(states, agent_indices)]
 def logp_from_logits_np(logits_np, a_idx: int) -> float:
     # logits_np: shape [A], numpy
     t = torch.as_tensor(logits_np[None, :], dtype=torch.float32)
@@ -562,79 +522,23 @@ class ObsNorm:
     def apply(self, x):
         var = np.clip(self.s / max(self.n-1, 1), 1e-3, 1e9)
         return (x - self.m) / np.sqrt(var)
-def visulize(agent, ae, layout, horizon=400, use_norm=False, obsnorm=None,
-             img_root="imgs/GUR", ipython_display=False):
-    # Build evaluator for this layout to get the correct featurizer
-    featurize_fn = ae.env.featurize_state_mdp  # do NOT use global base_env
 
-    class StudentPolicy(NNPolicy):
-        """
-        Wraps the trained shared actor. Returns a probability vector over 6 actions.
-        """
-        def __init__(self, actor: Actor):
-            super().__init__()
-            self.actor = actor.eval()  # inference mode
-
-        def state_policy(self, state, agent_index):
-            # 1) 96-D features from the evaluator env
-            feats = featurize_fn(state)[agent_index]
-            # 2) If you trained with normalization, apply it here
-            if use_norm and (obsnorm is not None):
-                feats = obsnorm.apply(feats)
-            # 3) Append the 2-D agent one-hot used in training → 98-D
-            feats = augment_obs(feats, agent_index)
-
-            x = torch.as_tensor(feats, dtype=torch.float32, device=device).unsqueeze(0)
-            assert x.shape[-1] == agent.actor.body[0].in_features, \
-                f"Feature dim mismatch: got {x.shape[-1]}, expected {agent.actor.body[0].in_features}"
-            with torch.no_grad():
-                logits = agent.actor(x).squeeze(0).cpu().numpy()
-            probs = np.exp(logits - logits.max()); probs /= (probs.sum() + 1e-8)
-            return probs
-
-        def multi_state_policy(self, states, agent_indices):
-            return [self.state_policy(s, i) for s, i in zip(states, agent_indices)]
-
-    policy0 = StudentPolicy(agent.actor)
-    policy1 = StudentPolicy(agent.actor)
-    pair = AgentPair(AgentFromPolicy(policy0), AgentFromPolicy(policy1))
-
-    trajs = ae.evaluate_agent_pair(pair, num_games=1)
-    out_dir = os.path.join(img_root, layout)
-    os.makedirs(out_dir, exist_ok=True)
-    StateVisualizer().display_rendered_trajectory(
-        trajs, img_directory_path=out_dir, ipython_display=ipython_display
-    )
-    print("len(trajs):", len(trajs), "| saved to:", out_dir)
-def compute_adv_ret_from_time_steps(rews, vals, dones, *, gamma=0.99, lam=0.95, last_v=None, last_done=None):
-    rews = np.asarray(rews, dtype=np.float32)
-    vals = np.asarray(vals, dtype=np.float32)
+def compute_adv_ret_from_time_steps(rews, vals, dones, gamma=0.99, lam=0.95):
+    """基于时间步向量计算 GAE，长度均为 [T]。返回 adv[T], ret[T]。"""
+    rews  = np.asarray(rews,  dtype=np.float32)
+    vals  = np.asarray(vals,  dtype=np.float32)
     dones = np.asarray(dones, dtype=np.float32)
     T = len(rews)
-
-    if last_v is None:
-        last_v = 0.0
-    if last_done is None:
-        last_done = 1.0  # 默认为终局，行为与旧实现一致
-
-
-    next_vals = np.empty_like(vals, dtype=np.float32)
-    if T > 1:
-        next_vals[:-1] = vals[1:]
-    next_vals[-1] = float(last_v)
-
-
-    next_mask = 1.0 - np.concatenate([dones[1:], np.array([last_done], np.float32)])
-
+    next_vals = np.concatenate([vals[1:], np.array([0.0], np.float32)])
+    next_mask = 1.0 - dones
     deltas = rews + gamma * next_vals * next_mask - vals
-
     adv = np.zeros_like(rews, dtype=np.float32)
     gae = 0.0
-    for t in range(T - 1, -1, -1):
+    for t in reversed(range(T)):
         gae = deltas[t] + gamma * lam * next_mask[t] * gae
         adv[t] = gae
-
     ret = adv + vals
+    # 标准化优势（按时间步）
     adv = (adv - adv.mean()) / (adv.std() + 1e-8)
     return adv, ret
 
@@ -676,7 +580,6 @@ def train_mappo(env, updates=2000, rollout_steps=2048, shaping_scale=1.0):
 
     best_soups = -1.0
     rewards_log, soups_log = [], []
-    ae = AgentEvaluator.from_layout_name({"layout_name": layout}, {"horizon": horizon})
     for upd in range(1, agent.cfg.total_updates + 1):
         # simple entropy schedule (optional but helps)
         if upd <= int(0.3 * agent.cfg.total_updates):
@@ -772,14 +675,11 @@ def train_mappo(env, updates=2000, rollout_steps=2048, shaping_scale=1.0):
         print(f"[upd {upd}] Regular： shaped_hit_rate={shaped_hits / len(buf['rew']):.3f}")
 
         #for k in buf: buf[k] = np.asarray(buf[k], dtype=np.float32)
-        last_joint = np.concatenate([o0_aug, o1_aug], axis=-1)
-        last_v = agent.value(last_joint[None, :])[0]
-        last_done = float(done)  # 1.0 if episode ended, else 0.0
+
         # === GAE ===
         adv, ret = compute_adv_ret_from_time_steps(
             step_rew, step_val, step_done,
-            gamma=agent.cfg.gamma, lam=agent.cfg.lam,
-            last_v=last_v, last_done=last_done
+            gamma=agent.cfg.gamma, lam=agent.cfg.lam
         )
 
         # batch = build_batch_from_time_steps(
@@ -836,7 +736,6 @@ def train_mappo_norm(env,  obsnorm, updates=2000, rollout_steps=2048, shaping_sc
 
     best_soups = -1.0
     rewards_log, soups_log = [], []
-    ae = AgentEvaluator.from_layout_name({"layout_name": layout}, {"horizon": horizon})
     for upd in range(1, agent.cfg.total_updates + 1):
         # # simple entropy schedule (optional but helps)
         # if upd <= int(0.3 * agent.cfg.total_updates):
@@ -883,11 +782,7 @@ def train_mappo_norm(env,  obsnorm, updates=2000, rollout_steps=2048, shaping_sc
 
             # step env
             obs, R, done, info = env.step([a0e, a1e])
-            # if "shaped_info_by_agent" in info:
-            #     print("shaped_info_by_agent:", info["shaped_info_by_agent"])
-            # elif "shaped_r_by_agent" in info:
-            #     print("shaped_r_by_agent:", info["shaped_r_by_agent"])
-            # print("info keys:", info.keys())
+
             # sparse + mild shaped reward
             shape_scale = 8.0 if upd <= 200 else agent.cfg.shaping_scale
             r = float(R) + shaped_team_reward(info, env, scale=shape_scale)
@@ -929,14 +824,11 @@ def train_mappo_norm(env,  obsnorm, updates=2000, rollout_steps=2048, shaping_sc
         # shaped-hit print (unchanged)
         shaped_hits = sum(1 for rr in buf["rew"] if (rr != 0.0 and rr < 20.0))
         print(f"[upd {upd}] Norm：shaped_hit_rate={shaped_hits / len(buf['rew']):.3f}")
-        last_joint = np.concatenate([o0_aug, o1_aug], axis=-1)
-        last_v = agent.value(last_joint[None, :])[0]
-        last_done = float(done)  # 1.0 if episode ended, else 0.0
+
         # === GAE ===
         adv, ret = compute_adv_ret_from_time_steps(
             step_rew, step_val, step_done,
-            gamma=agent.cfg.gamma, lam=agent.cfg.lam,
-            last_v=last_v, last_done=last_done
+            gamma=agent.cfg.gamma, lam=agent.cfg.lam
         )
 
         batch = {
@@ -956,7 +848,6 @@ def train_mappo_norm(env,  obsnorm, updates=2000, rollout_steps=2048, shaping_sc
         agent.update(batch)
 
         if upd % 10 == 0:
-            # visulize(agent, ae, layout)
             mean_ret, mean_soups = eval_soups_norm(agent, env, obsnorm,episodes=30)
             rewards_log.append(mean_ret)
             soups_log.append(mean_soups)
@@ -1000,10 +891,10 @@ def eval_soups(agent, env, episodes=20, hid=128):
             logits1, h1_next = agent.actor(x1, h1_t)
 
             # Stochastic eval to match your agent.act() behavior
-            pi0 = torch.distributions.Categorical(logits=logits0[0, -1])
-            pi1 = torch.distributions.Categorical(logits=logits1[0, -1])
-            a0 = int(pi0.sample().item())
-            a1 = int(pi1.sample().item())
+            a0 = int(torch.argmax(logits0[0, -1]).item())
+            a1 = int(torch.argmax(logits1[0, -1]).item())
+
+            # Optional hygiene consistent with training
             a0, a1 = mask_interact(o0, o1, a0, a1)
 
             obs, R, done, info = env.step([a0, a1])
@@ -1040,10 +931,8 @@ def eval_soups_norm(agent, env, obsnorm, episodes=20, hid=128):
             logits0, h0_next = agent.actor(x0, h0_t)   # logits0: [1, 1, A]
             logits1, h1_next = agent.actor(x1, h1_t)
 
-            pi0 = torch.distributions.Categorical(logits=logits0[0, -1])
-            pi1 = torch.distributions.Categorical(logits=logits1[0, -1])
-            a0 = int(pi0.sample().item())
-            a1 = int(pi1.sample().item())
+            a0 = int(torch.argmax(logits0[0, -1]).item())
+            a1 = int(torch.argmax(logits1[0, -1]).item())
 
 
             a0, a1 = mask_interact(o0, o1, a0, a1)
@@ -1093,27 +982,7 @@ class StudentPolicy(NNPolicy):
 
     def multi_state_policy(self, states, agent_indices):
         return [self.state_policy(s, i) for s, i in zip(states, agent_indices)]
-def visualization_using_existing_flow(agent,ae, layout, use_norm=False, obsnorm=None):
 
-    featurize_fn = ae.env.featurize_state_mdp
-
-    # NOTE: your loader signature is (file, layout). Pass the checkpoint path explicitly.
-    file = f"overcooked_{layout}_GUR_norm.pt" if use_norm else f"overcooked_{layout}_GUR.pt"
-    actor_sd, critic_sd, loaded_norm = load_mappo_ckpt(file, layout)
-    agent.actor.load_state_dict(actor_sd)
-    agent.critic.load_state_dict(critic_sd)
-
-    if use_norm and loaded_norm is not None:
-        obsnorm = loaded_norm
-
-    policy0 = MinimalRNNPolicy(agent.actor, featurize_fn, use_norm=use_norm, obsnorm=obsnorm, device=device)
-    policy1 = MinimalRNNPolicy(agent.actor, featurize_fn, use_norm=use_norm, obsnorm=obsnorm, device=device)
-    agent_pair = AgentPair(AgentFromPolicy(policy0), AgentFromPolicy(policy1))
-
-    trajs = ae.evaluate_agent_pair(agent_pair, num_games=1)
-    print("len(trajs):", len(trajs))
-    img_dir = f"imgs/{layout}/"
-    StateVisualizer().display_rendered_trajectory(trajs, img_directory_path=img_dir, ipython_display=True)
 # ====== Train MAPPO ======
 def sweep_layout(layout):
     IS_CRAMPED = (layout == "cramped_room")
@@ -1128,20 +997,6 @@ def sweep_layout(layout):
 
 Layouts=["cramped_room","coordination_ring","counter_circuit_o_1order"]
 # Layouts=["counter_circuit_o_1order"]
-results = {}
-for layout in Layouts:
-    print(f"layout is {layout}")
-    env, base_env, IS_CIRCUIT, IS_CRAMPED,IS_RING, ckpt =sweep_layout(layout)
-    agent, rewards_log, soups_log = train_mappo(env, updates=2000, rollout_steps=2048, shaping_scale=1.0)
-    if ckpt:
-        agent.actor.load_state_dict(ckpt["actor"]); agent.critic.load_state_dict(ckpt["critic"])
-    results[layout.split('_')[0]] = {"reward": rewards_log, "soups": soups_log}
-# Plot both metrics
-plot_training_metrics(results, metric="reward",
-                      save_dir="plots", filename="mappo_reward_GRU")
-plot_training_metrics(results, metric="soups",
-                      save_dir="plots", filename="mappo_soups_GRU")
-
 results = {}
 obsnorm_by_layout = {}
 for layout in Layouts:
@@ -1158,6 +1013,21 @@ plot_training_metrics(results, metric="reward",
                       save_dir="plots", filename="mappo_reward_norm_GRU")
 plot_training_metrics(results, metric="soups",
                       save_dir="plots", filename="mappo_soups_norm_GRU")
+#
+results = {}
+for layout in Layouts:
+    print(f"layout is {layout}")
+    env, base_env, IS_CIRCUIT, IS_CRAMPED,IS_RING, ckpt =sweep_layout(layout)
+    agent, rewards_log, soups_log = train_mappo(env, updates=2000, rollout_steps=2048, shaping_scale=1.0)
+    if ckpt:
+        agent.actor.load_state_dict(ckpt["actor"]); agent.critic.load_state_dict(ckpt["critic"])
+    results[layout.split('_')[0]] = {"reward": rewards_log, "soups": soups_log}
+# Plot both metrics
+plot_training_metrics(results, metric="reward",
+                      save_dir="plots", filename="mappo_reward_GRU")
+plot_training_metrics(results, metric="soups",
+                      save_dir="plots", filename="mappo_soups_GRU")
+
 # layout="counter_circuit_o_1order"
 # mdp = OvercookedGridworld.from_layout_name(layout, rew_shaping_params=reward_shaping)
 # base_env = OvercookedEnv.from_mdp(mdp, horizon=horizon, info_level=0)
