@@ -384,12 +384,14 @@ class PPOMulti:
 
     @torch.no_grad()
     def act(self, obs_np, h_np):
-        x = torch.as_tensor(obs_np[None, None, :], dtype=torch.float32, device=device)  # [B=1,T=1,D]
-        h = torch.as_tensor(h_np, dtype=torch.float32, device=device)                   # [1,1,H]
-        logits, hT = self.actor(x, h)               # logits: [1,1,A]
-        d = self.dist(logits[:, -1, :]) # [1,A]
+        x = torch.as_tensor(obs_np[None, None, :], dtype=torch.float32, device=device)
+        h = torch.as_tensor(h_np, dtype=torch.float32, device=device)
+        logits, hT = self.actor(x, h)  # [1,1,A]
+        last_logits = logits[:, -1, :]  # [1,A]
+        d = self.dist(last_logits)
         a = d.sample()
-        return int(a.item()), float(d.log_prob(a).item()), hT.detach().cpu().numpy()
+        return int(a.item()), float(d.log_prob(a).item()), hT.detach().cpu().numpy(), last_logits.squeeze(
+            0).cpu().numpy()
 
     @torch.no_grad()
     def value(self, joint_np):
@@ -492,6 +494,13 @@ class PPOMulti:
                                  cfg.max_grad_norm)
         self.opt.step()
 
+def logp_from_logits_np(logits_np, a_idx: int) -> float:
+    # logits_np: shape [A], numpy
+    t = torch.as_tensor(logits_np[None, :], dtype=torch.float32)
+    d = torch.distributions.Categorical(logits=t)
+    a = torch.tensor([a_idx], dtype=torch.int64)
+    return float(d.log_prob(a).item())
+
 class ObsNorm:
     def __init__(self, dim, eps=1e-8):
         self.m = np.zeros(dim, np.float32)
@@ -587,20 +596,22 @@ def train_mappo(env, updates=2000, rollout_steps=2048, shaping_scale=1.0):
             # x0 = torch.as_tensor(o0_aug[None, :], dtype=torch.float32, device=device)
             # x1 = torch.as_tensor(o1_aug[None, :], dtype=torch.float32, device=device)
             # sample with RNN
-            a0, lp0, h0 = agent.act(o0_aug, h0)
-            a1, lp1, h1 = agent.act(o1_aug, h1)
+            a0, lp0_samp, h0, logits0 = agent.act(o0_aug, h0)
+            a1, lp1_samp, h1, logits1 = agent.act(o1_aug, h1)
             # with torch.no_grad():
             #     dist0 = agent.dist(agent.actor(x0))
             #     dist1 = agent.dist(agent.actor(x1))
             #     a0 = int(dist0.sample().item())
             #     a1 = int(dist1.sample().item())
 
-            if upd <= 300 and np.random.rand() < 0.7:
+            if upd <= 50 and np.random.rand() < 0.1:
                 a0_exec, a1_exec = mask_interact(o0, o1, a0, a1)
                 a0_exec, a1_exec = maybe_bias_actions(steps, upd, a0_exec, a1_exec, o0, o1)
             else:
                 a0_exec, a1_exec = a0, a1
 
+            lp0 = logp_from_logits_np(logits0, a0_exec)
+            lp1 = logp_from_logits_np(logits1, a1_exec)
             # recompute logp for executed actions from the same dists
             # with torch.no_grad():
             #     lp0 = float(dist0.log_prob(torch.tensor(a0_exec, device=device)).cpu().item())
@@ -697,7 +708,7 @@ def train_mappo(env, updates=2000, rollout_steps=2048, shaping_scale=1.0):
                     "actor": agent.actor.state_dict(),
                     "critic": agent.critic.state_dict(),
                 }, f"overcooked_{layout}_GUR.pt")
-                print(f"Checkpoint saved to overcooked_{layout}.pt")
+                print(f"Checkpoint saved to overcooked_{layout}_GUR.pt")
 
     print(f"Best soups/ep observed: {best_soups:.2f}")
     return agent, rewards_log, soups_log
@@ -743,18 +754,19 @@ def train_mappo_norm(env,  obsnorm, updates=2000, rollout_steps=2048, shaping_sc
             o0_aug = augment_obs(o0n, agent_idx=0)
             o1_aug = augment_obs(o1n, agent_idx=1)
             # sample actions from NORMALIZED inputs
-            a0, lp0, h0 = agent.act(o0_aug, h0)
-            a1, lp1, h1 = agent.act(o1_aug, h1)
+            a0, lp0_samp, h0, logits0 = agent.act(o0_aug, h0)
+            a1, lp1_samp, h1, logits1 = agent.act(o1_aug, h1)
 
 
-            if upd <= 300 and np.random.rand() < 0.7:
+            if upd <= 50 and np.random.rand() < 0.1:
                 a0_exec, a1_exec = mask_interact(o0, o1, a0, a1)
                 a0_exec, a1_exec = maybe_bias_actions(steps, upd, a0_exec, a1_exec, o0, o1)
             else:
                 a0_exec, a1_exec = a0, a1
             a0e, a1e = a0_exec, a1_exec  # keep whatever ring/circuit tweaks you already do
             # recompute logp for executed actions from the same dists
-
+            lp0 = logp_from_logits_np(logits0, a0_exec)
+            lp1 = logp_from_logits_np(logits1, a1_exec)
             # critic sees NORMALIZED joint
             joint = np.concatenate([o0_aug, o1_aug], axis=-1)
             # joint = np.concatenate([o0, o1], axis=-1)
@@ -843,7 +855,7 @@ def train_mappo_norm(env,  obsnorm, updates=2000, rollout_steps=2048, shaping_sc
                     "obsnorm_m": obsnorm.m,
                     "obsnorm_s": obsnorm.s,
                     "obsnorm_n": obsnorm.n
-                }, f"overcooked_{layout}_norm.pt")
+                }, f"overcooked_{layout}_GUR_norm.pt")
                 print(f"Checkpoint saved to overcooked_{layout}_GUR_norm.pt")
 
     print(f"Best soups/ep observed: {best_soups:.2f}")
@@ -983,7 +995,7 @@ for layout in Layouts:
     print(f"layout is {layout}")
     env, base_env, IS_CIRCUIT, IS_CRAMPED,IS_RING, ckpt =sweep_layout(layout)
     norm = get_layout_norm(layout, env, obsnorm_by_layout)
-    agent, rewards_log, soups_log = train_mappo_norm(env, norm, updates=10, rollout_steps=2048, shaping_scale=1.0)
+    agent, rewards_log, soups_log = train_mappo_norm(env, norm, updates=2000, rollout_steps=2048, shaping_scale=1.0)
     if ckpt:
         agent.actor.load_state_dict(ckpt["actor"]); agent.critic.load_state_dict(ckpt["critic"])
     results[layout.split('_')[0]] = {"reward": rewards_log, "soups": soups_log}
@@ -998,7 +1010,7 @@ results = {}
 for layout in Layouts:
     print(f"layout is {layout}")
     env, base_env, IS_CIRCUIT, IS_CRAMPED,IS_RING, ckpt =sweep_layout(layout)
-    agent, rewards_log, soups_log = train_mappo(env, updates=10, rollout_steps=2048, shaping_scale=1.0)
+    agent, rewards_log, soups_log = train_mappo(env, updates=2000, rollout_steps=2048, shaping_scale=1.0)
     if ckpt:
         agent.actor.load_state_dict(ckpt["actor"]); agent.critic.load_state_dict(ckpt["critic"])
     results[layout.split('_')[0]] = {"reward": rewards_log, "soups": soups_log}
