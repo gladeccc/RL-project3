@@ -524,7 +524,7 @@ class ObsNorm:
         var = np.clip(self.s / max(self.n-1, 1), 1e-3, 1e9)
         return (x - self.m) / np.sqrt(var)
 def visulize(agent, ae, layout, horizon=400, use_norm=False, obsnorm=None,
-             img_root="imgs", ipython_display=False):
+             img_root="imgs/GUR", ipython_display=False):
     # Build evaluator for this layout to get the correct featurizer
     featurize_fn = ae.env.featurize_state_mdp  # do NOT use global base_env
 
@@ -829,7 +829,11 @@ def train_mappo_norm(env,  obsnorm, updates=2000, rollout_steps=2048, shaping_sc
 
             # step env
             obs, R, done, info = env.step([a0e, a1e])
-
+            # if "shaped_info_by_agent" in info:
+            #     print("shaped_info_by_agent:", info["shaped_info_by_agent"])
+            # elif "shaped_r_by_agent" in info:
+            #     print("shaped_r_by_agent:", info["shaped_r_by_agent"])
+            # print("info keys:", info.keys())
             # sparse + mild shaped reward
             shape_scale = 8.0 if upd <= 200 else agent.cfg.shaping_scale
             r = float(R) + shaped_team_reward(info, env, scale=shape_scale)

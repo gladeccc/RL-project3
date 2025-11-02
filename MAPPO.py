@@ -42,7 +42,7 @@ reward_shaping = {
     # "NEAR_POT_REWARD": 1,
     # "NEAR_ONION_REWARD": 1,
     # "NEAR_DISH_REWARD": 1,
-    "ONION_PICKUP_REW": 1,
+    "ONION_PICKUP_REWARD": 1,
     "DISH_PICKUP_REWARD": 1,
     "SOUP_PICKUP_REWARD": 5,
     "PLACEMENT_IN_POT_REW": 4,
@@ -144,10 +144,12 @@ def likely_legal_interact(feats: np.ndarray) -> bool:
 
 def mask_interact(obs0: np.ndarray, obs1: np.ndarray, a0: int, a1: int):
     """If Interact is unlikely, replace with a random move."""
+    blocked = [False, False]
     if a0 == INTERACT and not likely_legal_interact(obs0):
-        a0 = np.random.choice([1,2,3,4])   # NSEW
+        a0 = np.random.choice([1,2,3,4]);blocked[0] = True   # NSEW
     if a1 == INTERACT and not likely_legal_interact(obs1):
-        a1 = np.random.choice([1,2,3,4])
+        a1 = np.random.choice([1,2,3,4]);blocked[0] = True
+    if any(blocked): print("interact blocked:", blocked)
     return a0, a1
 
 def compute_shaped_rewards(
@@ -833,7 +835,11 @@ def train_mappo_norm(env,  obsnorm, updates=2000, rollout_steps=2048, shaping_sc
 
             # step env
             obs, R, done, info = env.step([a0e, a1e])
-            #print("sparse R =", R, "| shaped =", info.get("shaped_r_by_agent"))
+            # if "shaped_info_by_agent" in info:
+            #     print("shaped_info_by_agent:", info["shaped_info_by_agent"])
+            # elif "shaped_r_by_agent" in info:
+            #     print("shaped_r_by_agent:", info["shaped_r_by_agent"])
+            # print("info keys:", info.keys())
             # sparse + mild shaped reward
             shape_scale = 8.0 if upd <= 200 else agent.cfg.shaping_scale
             r = float(R) + shaped_team_reward(info, env, scale=shape_scale)
