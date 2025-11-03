@@ -20,6 +20,7 @@ import torch.nn.functional as F
 from dataclasses import dataclass
 import matplotlib.pyplot as plt
 from gym.vector import AsyncVectorEnv
+from helpers import *
 
 ## Uncomment if you'd like to use your personal Google Drive to store outputs
 ## from your runs. You can find some hooks to Google Drive commented
@@ -56,11 +57,9 @@ reward_shaping = {
 # Length of Episodes.  Do not modify for your submission!
 # Modification will result in a grading penalty!
 horizon = 400
-
-
-
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 device = "cpu"
+INTERACT = 5
 def get_obs_pair(obs_dict):
     # Your env returns dict; features are already aligned for obs order
     return obs_dict["both_agent_obs"][0], obs_dict["both_agent_obs"][1]
@@ -111,7 +110,7 @@ def heuristic_nudge(obs_feat: np.ndarray) -> int:
 
 def maybe_bias_actions(step_idx: int, upd_idx: int, a0: int, a1: int, o0: np.ndarray, o1: np.ndarray):
     """For the first ~10 updates, with small prob, overwrite actions with heuristic moves."""
-    if upd_idx <= 10 and np.random.rand() < 0.30:
+    if upd_idx <= 100 and np.random.rand() < 0.50:
         a0 = heuristic_nudge(o0) if np.random.rand() < 0.7 else a0
         a1 = heuristic_nudge(o1) if np.random.rand() < 0.7 else a1
     return a0, a1
@@ -146,68 +145,14 @@ def mask_interact(obs0: np.ndarray, obs1: np.ndarray, a0: int, a1: int):
     """If Interact is unlikely, replace with a random move."""
     blocked = [False, False]
     if a0 == INTERACT and not likely_legal_interact(obs0):
-        a0 = np.random.choice([1,2,3,4]);blocked[0] = True   # NSEW
+        a0 = np.random.choice([1,2,3,4])
+        blocked[0] = True   # NSEW
     if a1 == INTERACT and not likely_legal_interact(obs1):
-        a1 = np.random.choice([1,2,3,4]);blocked[0] = True
-    if any(blocked): print("interact blocked:", blocked)
+        a1 = np.random.choice([1,2,3,4])
+        blocked[1] = True
+    if blocked[0] or blocked[1]:
+        print("interact blocked:", blocked)
     return a0, a1
-
-def compute_shaped_rewards(
-    info: dict,
-    env,
-    step: int,
-    *,
-    sparse_R: float,
-    early_shape_steps: int = 50_000,
-    shape_scale_max: float = 6.0,
-    shape_scale_min: float = 1.0,
-    extra_event_bonus: float = 5.0
-):
-    """
-    Returns:
-      R_team: float        # the sparse team reward (unchanged)
-      r0_total: float      # per-agent 0: shaped component (scaled)
-      r1_total: float      # per-agent 1: shaped component (scaled)
-      shaped_hit: int      # 1 if any non-zero shaping happened on this step, else 0
-    """
-    # Scale schedule: big at start, smaller later
-    shape_scale = shape_scale_max if step < early_shape_steps else shape_scale_min
-
-    # Default no shaping
-    r0, r1 = 0.0, 0.0
-
-    # Built-in shaping from the env (e.g., onion in pot, dish pickup, soup pickup)
-    rs = info.get("shaped_r_by_agent")
-    if rs is not None:
-        # env can swap player roles; align to current index
-        if getattr(env, "agent_idx", 0):
-            # env.agent_idx == 1 means swap order
-            r0, r1 = float(rs[1]), float(rs[0])
-        else:
-            r0, r1 = float(rs[0]), float(rs[1])
-
-    # Optional: bonus for clearly attributable key events if your env surfaces them
-    # (Guarded to not crash when keys are missing.)
-    # Example keys you might add in a custom wrapper:
-    #   info["soup_plate_pickup_by_agent"] in {0,1}
-    #   info["served_by_agent"] in {0,1}
-    a_plate = info.get("soup_plate_pickup_by_agent", None)
-    if a_plate in (0, 1):
-        if a_plate == 0: r0 += extra_event_bonus
-        else:            r1 += extra_event_bonus
-
-    a_serve = info.get("served_by_agent", None)
-    if a_serve in (0, 1):
-        # small extra nudge on top of +20 sparse (don’t overpower)
-        if a_serve == 0: r0 += extra_event_bonus * 0.5
-        else:            r1 += extra_event_bonus * 0.5
-
-    # Scale shaping
-    r0_total = r0 * shape_scale
-    r1_total = r1 * shape_scale
-
-    shaped_hit = int((r0_total != 0.0) or (r1_total != 0.0))
-    return float(sparse_R), float(r0_total), float(r1_total), shaped_hit
 
 def plot_training_metrics(results_dict, metric="reward",save_dir=None, filename=None, dpi=200, fmt="png",
                           title_prefix="MAPPO training performance"):
@@ -241,23 +186,6 @@ def plot_training_metrics(results_dict, metric="reward",save_dir=None, filename=
     return saved_path
 
 # ---------- helpers to build vector envs ----------
-def make_overcooked_env(layout, reward_shaping, horizon):
-    def _init():
-        mdp = OvercookedGridworld.from_layout_name(layout, rew_shaping_params=reward_shaping)
-        base = OvercookedEnv.from_mdp(mdp, horizon=horizon, info_level=0)
-        return gym.make("Overcooked-v0", base_env=base, featurize_fn=base.featurize_state_mdp)
-    return _init
-
-def build_vec_env(layouts, copies_per_layout=2):
-    env_fns = []
-    layout_ids = []
-    for l in layouts:
-        for _ in range(copies_per_layout):
-            env_fns.append(make_overcooked_env(l, reward_shaping, horizon))
-            layout_ids.append(l)
-    vec = AsyncVectorEnv(env_fns)
-    layout_ids = np.array(layout_ids)  # shape (N,)
-    return vec, layout_ids
 
 def get_layout_norm(layout_name: str, env, pool: dict):
     if layout_name not in pool:
@@ -270,136 +198,54 @@ def augment_obs(obs_vec, agent_idx, use_norm=False, obsnorm=None):
     agent_id = np.array([1, 0], dtype=np.float32) if agent_idx == 0 else np.array([0, 1], dtype=np.float32)
     return np.concatenate([obs_vec, agent_id], axis=-1)
 
-def load_mappo_ckpt(file,layout):
-    ckpt, path_used = None, None
-    if os.path.exists(file):
-        ckpt = torch.load(file, map_location="cpu")
-        path_used = file
-    if ckpt is None:
-        raise FileNotFoundError(f"No checkpoint found for layout={layout}. Tried: {file}")
+def compute_adv_ret_from_time_steps(rews, vals, dones, gamma=0.99, lam=0.95):
+    rews  = np.asarray(rews,  dtype=np.float32)
+    vals  = np.asarray(vals,  dtype=np.float32)
+    dones = np.asarray(dones, dtype=np.float32)
+    T = len(rews)
+    next_vals = np.concatenate([vals[1:], np.array([0.0], np.float32)])
+    next_mask = 1.0 - dones
+    deltas = rews + gamma * next_vals * next_mask - vals
+    adv = np.zeros_like(rews, dtype=np.float32)
+    gae = 0.0
+    for t in reversed(range(T)):
+        gae = deltas[t] + gamma * lam * next_mask[t] * gae
+        adv[t] = gae
+    ret = adv + vals
+    adv = (adv - adv.mean()) / (adv.std() + 1e-8)
+    return adv, ret
 
-    actor_sd  = ckpt["actor"]
-    critic_sd = ckpt["critic"]
-    obsnorm = None
-    if all(k in ckpt for k in ["obsnorm_m","obsnorm_s","obsnorm_n"]):
-        m, s, n = ckpt["obsnorm_m"], ckpt["obsnorm_s"], ckpt["obsnorm_n"]
-        obsnorm = ObsNorm(dim=m.shape[0])
-        obsnorm.m, obsnorm.s, obsnorm.n = m, s, float(n)
+def build_batch_from_time_steps(step_obs0, step_obs1,
+                                step_act0, step_act1,
+                                step_logp0, step_logp1,
+                                step_joint,
+                                adv, ret):
+    obs = np.vstack([np.asarray(step_obs0, dtype=np.float32),
+                     np.asarray(step_obs1, dtype=np.float32)])  # [2T, obs_dim]
+    act = np.concatenate([np.asarray(step_act0, dtype=np.int64),
+                          np.asarray(step_act1, dtype=np.int64)], axis=0)  # [2T]
+    logp = np.concatenate([np.asarray(step_logp0, dtype=np.float32),
+                           np.asarray(step_logp1, dtype=np.float32)], axis=0)
+    adv_b = np.concatenate([adv, adv], axis=0).astype(np.float32)  # [2T]
+    ret_b = np.concatenate([ret, ret], axis=0).astype(np.float32)  # [2T]
+    joint = np.vstack([np.asarray(step_joint, dtype=np.float32),
+                       np.asarray(step_joint, dtype=np.float32)])  # [2T, 2*obs_dim]
+    return {
+        "obs": obs, "act": act, "logp": logp,
+        "adv": adv_b, "ret": ret_b, "joint_obs": joint
+    }
 
-    print(f"Loaded checkpoint: {path_used} | has_norm_stats={obsnorm is not None}")
-    return actor_sd, critic_sd, obsnorm
+def sweep_layout(layout):
+    IS_CRAMPED = (layout == "cramped_room")
+    IS_RING = (layout == "coordination_ring")
+    IS_CIRCUIT = (layout == "counter_circuit_o_1order")
+    # Build the environment.  Do not modify!
+    mdp = OvercookedGridworld.from_layout_name(layout, rew_shaping_params=reward_shaping)
+    base_env = OvercookedEnv.from_mdp(mdp, horizon=horizon, info_level=0)
+    env = gym.make("Overcooked-v0", base_env=base_env, featurize_fn=base_env.featurize_state_mdp)
+    ckpt = None
+    return env, base_env, IS_CIRCUIT, IS_CRAMPED,IS_RING, ckpt
 
-def visualization_using_existing_flow(agent,layout):
-    ae = AgentEvaluator.from_layout_name({"layout_name": layout}, {"horizon": horizon})
-    featurize_fn = ae.env.featurize_state_mdp
-
-    actor_sd, critic_sd, obsnorm = load_mappo_ckpt(layout)
-    agent.actor.load_state_dict(actor_sd)
-    agent.critic.load_state_dict(critic_sd)
-
-class PotentialShapingWrapper(gym.Wrapper):
-    """
-    Potential-based reward shaping:
-      F(s,a,s') = gamma * Phi(s') - Phi(s) + small event bonuses/penalties.
-    Works with featurized obs vectors (96-D); no layout-specific indices required.
-    """
-    def __init__(self, env, gamma=0.99,
-                 progress_w=0.08,         # distance reduction weight per agent
-                 adj_interact_bonus=0.2,  # reward if INTERACT at adjacency
-                 head_on_penalty=-0.05,   # discourage head-on collisions in corridors
-                 anneal_steps=150_000):   # linearly anneal shaping to ~0
-        super().__init__(env)
-        self.gamma = gamma
-        self.progress_w = progress_w
-        self.adj_interact_bonus = adj_interact_bonus
-        self.head_on_penalty = head_on_penalty
-        self.anneal_steps = max(1, anneal_steps)
-        self.total_steps = 0
-        self.prev_phi_0 = 0.0
-        self.prev_phi_1 = 0.0
-        self.prev_obs = None
-
-    @staticmethod
-    def _min_nearby_manhattan(obs_vec: np.ndarray, radius_cap: int = 6) -> float:
-        """
-        Scan obs for (dx,dy) pairs. Treat small |dx|+|dy| as 'nearby station' candidates.
-        Return the minimum capped Manhattan distance we can find.
-        """
-        best = 999.0
-        v = obs_vec
-        for i in range(0, len(v)-1):
-            dx, dy = v[i], v[i+1]
-            m = abs(dx) + abs(dy)
-            if 0 < m < best and m <= radius_cap:
-                best = m
-        return best if best < 999.0 else radius_cap
-
-    @staticmethod
-    def _likely_adjacent(obs_vec: np.ndarray) -> bool:
-        v = obs_vec.astype(np.int32)
-        for i in range(0, len(v)-1):
-            dx, dy = v[i], v[i+1]
-            if (abs(dx) == 1 and dy == 0) or (abs(dy) == 1 and dx == 0):
-                return True
-        return False
-
-    @staticmethod
-    def _is_head_on(a0: int, a1: int) -> bool:
-        # 0:stay, 1:up, 2:down, 3:left, 4:right, 5:interact
-        return (a0 == 1 and a1 == 2) or (a0 == 2 and a1 == 1) or (a0 == 3 and a1 == 4) or (a0 == 4 and a1 == 3)
-
-    def reset(self, **kwargs):
-        self.prev_phi_0 = 0.0
-        self.prev_phi_1 = 0.0
-        self.prev_obs = super().reset(**kwargs)
-        return self.prev_obs
-
-    def step(self, actions):
-        obs, sparse_R, done, info = super().step(actions)
-
-        # Extract both-agent 96-D obs
-        o0, o1 = obs["both_agent_obs"]
-        # Fresh potentials (smaller is closer => we invert so larger is better)
-        d0 = self._min_nearby_manhattan(o0)
-        d1 = self._min_nearby_manhattan(o1)
-        phi0 = -d0
-        phi1 = -d1
-
-        # Anneal shaping multiplier over time to avoid breadcrumb addiction
-        alpha = max(0.0, 1.0 - (self.total_steps / float(self.anneal_steps)))
-
-        # Potential-based progress (team sum keeps it cooperative)
-        F0 = self.gamma * phi0 - self.prev_phi_0
-        F1 = self.gamma * phi1 - self.prev_phi_1
-        progress_bonus = self.progress_w * (max(0.0, F0) + max(0.0, F1))
-
-        # Adjacency interact bonus (only when INTERACT and adjacency makes sense)
-        adj_bonus = 0.0
-        if (actions[0] == 5 and self._likely_adjacent(o0)): adj_bonus += self.adj_interact_bonus
-        if (actions[1] == 5 and self._likely_adjacent(o1)): adj_bonus += self.adj_interact_bonus
-
-        # Anti head-on (circuit corridor killer)
-        anti_block = self.head_on_penalty if self._is_head_on(actions[0], actions[1]) else 0.0
-
-        shaped = alpha * (progress_bonus + adj_bonus + anti_block)
-
-        # Combine with your existing built-in shaping readout (if any)
-        built_in = 0.0
-        rs = info.get("shaped_r_by_agent")
-        if rs is not None:
-            # keep small to avoid overpowering
-            built_in = 0.5 * 0.5 * (float(rs[0]) + float(rs[1]))
-
-        total_team_reward = float(sparse_R) + shaped + built_in
-
-        # Update state
-        self.prev_phi_0 = phi0
-        self.prev_phi_1 = phi1
-        self.prev_obs = obs
-        self.total_steps += 1
-
-        # Put shaped total back into env API shape: we keep team reward in R, retain info
-        return obs, total_team_reward, done, info
 
 class Actor(nn.Module):
     # Produces logits over 6 discrete actions for ONE agent
@@ -420,9 +266,6 @@ class CentralCritic(nn.Module):
 
 # ----- action masking: only press Interact when facing something useful -----
 # Action mapping we’ve been using: 0:stay, 1:up, 2:down, 3:left, 4:right, 5:interact
-INTERACT = 5
-
-
 
 @dataclass
 class PPOCfg:
@@ -496,109 +339,6 @@ class PPOMulti:
                     list(self.actor.parameters()) + list(self.critic.parameters()), cfg.max_grad_norm
                 )
                 self.opt.step()
-class PotentialShapingWrapper(gym.Wrapper):
-    """
-    Potential-based reward shaping:
-      F(s,a,s') = gamma * Phi(s') - Phi(s) + small event bonuses/penalties.
-    Works with featurized obs vectors (96-D); no layout-specific indices required.
-    """
-    def __init__(self, env, gamma=0.99,
-                 progress_w=0.08,         # distance reduction weight per agent
-                 adj_interact_bonus=0.2,  # reward if INTERACT at adjacency
-                 head_on_penalty=-0.05,   # discourage head-on collisions in corridors
-                 anneal_steps=150_000):   # linearly anneal shaping to ~0
-        super().__init__(env)
-        self.gamma = gamma
-        self.progress_w = progress_w
-        self.adj_interact_bonus = adj_interact_bonus
-        self.head_on_penalty = head_on_penalty
-        self.anneal_steps = max(1, anneal_steps)
-        self.total_steps = 0
-        self.prev_phi_0 = 0.0
-        self.prev_phi_1 = 0.0
-        self.prev_obs = None
-
-    @staticmethod
-    def _min_nearby_manhattan(obs_vec: np.ndarray, radius_cap: int = 6) -> float:
-        """
-        Scan obs for (dx,dy) pairs. Treat small |dx|+|dy| as 'nearby station' candidates.
-        Return the minimum capped Manhattan distance we can find.
-        """
-        best = 999.0
-        v = obs_vec
-        for i in range(0, len(v)-1):
-            dx, dy = v[i], v[i+1]
-            m = abs(dx) + abs(dy)
-            if 0 < m < best and m <= radius_cap:
-                best = m
-        return best if best < 999.0 else radius_cap
-
-    @staticmethod
-    def _likely_adjacent(obs_vec: np.ndarray) -> bool:
-        v = obs_vec.astype(np.int32)
-        for i in range(0, len(v)-1):
-            dx, dy = v[i], v[i+1]
-            if (abs(dx) == 1 and dy == 0) or (abs(dy) == 1 and dx == 0):
-                return True
-        return False
-
-    @staticmethod
-    def _is_head_on(a0: int, a1: int) -> bool:
-        # 0:stay, 1:up, 2:down, 3:left, 4:right, 5:interact
-        return (a0 == 1 and a1 == 2) or (a0 == 2 and a1 == 1) or (a0 == 3 and a1 == 4) or (a0 == 4 and a1 == 3)
-
-    def reset(self, **kwargs):
-        self.prev_phi_0 = 0.0
-        self.prev_phi_1 = 0.0
-        self.prev_obs = super().reset(**kwargs)
-        return self.prev_obs
-
-    def step(self, actions):
-        obs, sparse_R, done, info = super().step(actions)
-
-        # Extract both-agent 96-D obs
-        o0, o1 = obs["both_agent_obs"]
-        # Fresh potentials (smaller is closer => we invert so larger is better)
-        d0 = self._min_nearby_manhattan(o0)
-        d1 = self._min_nearby_manhattan(o1)
-        phi0 = -d0
-        phi1 = -d1
-
-        # Anneal shaping multiplier over time to avoid breadcrumb addiction
-        alpha = max(0.0, 1.0 - (self.total_steps / float(self.anneal_steps)))
-
-        # Potential-based progress (team sum keeps it cooperative)
-        F0 = self.gamma * phi0 - self.prev_phi_0
-        F1 = self.gamma * phi1 - self.prev_phi_1
-        progress_bonus = self.progress_w * (max(0.0, F0) + max(0.0, F1))
-
-        # Adjacency interact bonus (only when INTERACT and adjacency makes sense)
-        adj_bonus = 0.0
-        if (actions[0] == 5 and self._likely_adjacent(o0)): adj_bonus += self.adj_interact_bonus
-        if (actions[1] == 5 and self._likely_adjacent(o1)): adj_bonus += self.adj_interact_bonus
-
-        # Anti head-on (circuit corridor killer)
-        anti_block = self.head_on_penalty if self._is_head_on(actions[0], actions[1]) else 0.0
-
-        shaped = alpha * (progress_bonus + adj_bonus + anti_block)
-
-        # Combine with your existing built-in shaping readout (if any)
-        built_in = 0.0
-        rs = info.get("shaped_r_by_agent")
-        if rs is not None:
-            # keep small to avoid overpowering
-            built_in = 0.5 * 0.5 * (float(rs[0]) + float(rs[1]))
-
-        total_team_reward = float(sparse_R) + shaped + built_in
-
-        # Update state
-        self.prev_phi_0 = phi0
-        self.prev_phi_1 = phi1
-        self.prev_obs = obs
-        self.total_steps += 1
-
-        # Put shaped total back into env API shape: we keep team reward in R, retain info
-        return obs, total_team_reward, done, info
 class ObsNorm:
     def __init__(self, dim, eps=1e-8):
         self.m = np.zeros(dim, np.float32)
@@ -612,45 +352,6 @@ class ObsNorm:
     def apply(self, x):
         var = np.clip(self.s / max(self.n-1, 1), 1e-3, 1e9)
         return (x - self.m) / np.sqrt(var)
-
-def compute_adv_ret_from_time_steps(rews, vals, dones, gamma=0.99, lam=0.95):
-    """基于时间步向量计算 GAE，长度均为 [T]。返回 adv[T], ret[T]。"""
-    rews  = np.asarray(rews,  dtype=np.float32)
-    vals  = np.asarray(vals,  dtype=np.float32)
-    dones = np.asarray(dones, dtype=np.float32)
-    T = len(rews)
-    next_vals = np.concatenate([vals[1:], np.array([0.0], np.float32)])
-    next_mask = 1.0 - dones
-    deltas = rews + gamma * next_vals * next_mask - vals
-    adv = np.zeros_like(rews, dtype=np.float32)
-    gae = 0.0
-    for t in reversed(range(T)):
-        gae = deltas[t] + gamma * lam * next_mask[t] * gae
-        adv[t] = gae
-    ret = adv + vals
-    adv = (adv - adv.mean()) / (adv.std() + 1e-8)
-    return adv, ret
-
-def build_batch_from_time_steps(step_obs0, step_obs1,
-                                step_act0, step_act1,
-                                step_logp0, step_logp1,
-                                step_joint,
-                                adv, ret):
-    obs = np.vstack([np.asarray(step_obs0, dtype=np.float32),
-                     np.asarray(step_obs1, dtype=np.float32)])  # [2T, obs_dim]
-    act = np.concatenate([np.asarray(step_act0, dtype=np.int64),
-                          np.asarray(step_act1, dtype=np.int64)], axis=0)  # [2T]
-    logp = np.concatenate([np.asarray(step_logp0, dtype=np.float32),
-                           np.asarray(step_logp1, dtype=np.float32)], axis=0)
-    # 广播
-    adv_b = np.concatenate([adv, adv], axis=0).astype(np.float32)  # [2T]
-    ret_b = np.concatenate([ret, ret], axis=0).astype(np.float32)  # [2T]
-    joint = np.vstack([np.asarray(step_joint, dtype=np.float32),
-                       np.asarray(step_joint, dtype=np.float32)])  # [2T, 2*obs_dim]
-    return {
-        "obs": obs, "act": act, "logp": logp,
-        "adv": adv_b, "ret": ret_b, "joint_obs": joint
-    }
 def train_mappo(env, updates=2000, rollout_steps=2048, shaping_scale=1.0):
     # Probe dims
     obs = env.reset()
@@ -817,7 +518,7 @@ def train_mappo_norm(env,  obsnorm, updates=2000, rollout_steps=2048, shaping_sc
                 a0 = int(dist0.sample().item())
                 a1 = int(dist1.sample().item())
 
-            if upd <= 300 and np.random.rand() < 0.7:
+            if upd <= 300 and np.random.rand() < 0.9:
                 a0_exec, a1_exec = mask_interact(o0, o1, a0, a1)
                 a0_exec, a1_exec = maybe_bias_actions(steps, upd, a0_exec, a1_exec, o0, o1)
             else:
@@ -895,7 +596,7 @@ def train_mappo_norm(env,  obsnorm, updates=2000, rollout_steps=2048, shaping_sc
         agent.update(batch)
 
         if upd % 10 == 0:
-            visulize(agent,ae, layout)
+            #visulize(agent,ae, layout)
             mean_ret, mean_soups = eval_soups_norm(agent, env, obsnorm,episodes=30)
             rewards_log.append(mean_ret)
             soups_log.append(mean_soups)
@@ -947,7 +648,7 @@ def eval_soups(agent, env, episodes=20):
     return float(np.mean(rets)), soups / float(episodes)
 
 @torch.no_grad()
-def eval_soups_norm(agent, env, obsnorm, episodes=20):
+def eval_soups_norm(agent, env, obsnorm, episodes=100):
     """
     Evaluate MAPPO agent trained with normalized observations.
     Args:        agent: trained PPOMulti agent
@@ -970,10 +671,13 @@ def eval_soups_norm(agent, env, obsnorm, episodes=20):
          # Actor forward (greedy)
          o0_aug = augment_obs(o0n, 0)
          o1_aug = augment_obs(o1n, 1)
+
          x0 = torch.as_tensor(o0_aug[None, :], dtype=torch.float32, device=device)
          x1 = torch.as_tensor(o1_aug[None, :], dtype=torch.float32, device=device)
-         a0 = int(torch.argmax(agent.actor(x0), dim=-1).item())
-         a1 = int(torch.argmax(agent.actor(x1), dim=-1).item())            # Step env
+
+         a0 = int(agent.dist(agent.actor(x0)).sample().item())
+         a1 = int(agent.dist(agent.actor(x1)).sample().item())
+
          a0, a1 = mask_interact(o0, o1, a0, a1)  # same hygiene as training
 
          obs, R, done, info = env.step([a0, a1])
@@ -992,112 +696,39 @@ def eval_soups_norm(agent, env, obsnorm, episodes=20):
 
 # The below code is a partcular way to rollout episodes in a format
 # compatible with the built-in state visualizer.
-# ====== Policy wrapper compatible with AgentEvaluator/StateVisualizer ======
-def visulize(agent, ae, layout, horizon=400, use_norm=False, obsnorm=None,
-             img_root="imgs", ipython_display=False):
-    # Build evaluator for this layout to get the correct featurizer
-    featurize_fn = ae.env.featurize_state_mdp  # do NOT use global base_env
-
-    class StudentPolicy(NNPolicy):
-        """
-        Wraps the trained shared actor. Returns a probability vector over 6 actions.
-        """
-        def __init__(self, actor: Actor):
-            super().__init__()
-            self.actor = actor.eval()  # inference mode
-
-        def state_policy(self, state, agent_index):
-            # 1) 96-D features from the evaluator env
-            feats = featurize_fn(state)[agent_index]
-            # 2) If you trained with normalization, apply it here
-            if use_norm and (obsnorm is not None):
-                feats = obsnorm.apply(feats)
-            # 3) Append the 2-D agent one-hot used in training → 98-D
-            feats = augment_obs(feats, agent_index)
-
-            x = torch.as_tensor(feats, dtype=torch.float32, device=device).unsqueeze(0)
-            assert x.shape[-1] == agent.actor.body[0].in_features, \
-                f"Feature dim mismatch: got {x.shape[-1]}, expected {agent.actor.body[0].in_features}"
-            with torch.no_grad():
-                logits = agent.actor(x).squeeze(0).cpu().numpy()
-            probs = np.exp(logits - logits.max()); probs /= (probs.sum() + 1e-8)
-            return probs
-
-        def multi_state_policy(self, states, agent_indices):
-            return [self.state_policy(s, i) for s, i in zip(states, agent_indices)]
-
-    policy0 = StudentPolicy(agent.actor)
-    policy1 = StudentPolicy(agent.actor)
-    pair = AgentPair(AgentFromPolicy(policy0), AgentFromPolicy(policy1))
-
-    trajs = ae.evaluate_agent_pair(pair, num_games=1)
-    out_dir = os.path.join(img_root, layout)
-    os.makedirs(out_dir, exist_ok=True)
-    StateVisualizer().display_rendered_trajectory(
-        trajs, img_directory_path=out_dir, ipython_display=ipython_display
-    )
-    print("len(trajs):", len(trajs), "| saved to:", out_dir)
 
 # ====== Train MAPPO ======
-def sweep_layout(layout):
-    IS_CRAMPED = (layout == "cramped_room")
-    IS_RING = (layout == "coordination_ring")
-    IS_CIRCUIT = (layout == "counter_circuit_o_1order")
-    # Build the environment.  Do not modify!
-    mdp = OvercookedGridworld.from_layout_name(layout, rew_shaping_params=reward_shaping)
-    base_env = OvercookedEnv.from_mdp(mdp, horizon=horizon, info_level=0)
-    env = gym.make("Overcooked-v0", base_env=base_env, featurize_fn=base_env.featurize_state_mdp)
-    ckpt = None
-    return env, base_env, IS_CIRCUIT, IS_CRAMPED,IS_RING, ckpt
 
-Layouts=["cramped_room","coordination_ring","counter_circuit_o_1order"]
-Layouts=["counter_circuit_o_1order"]
-results = {}
-obsnorm_by_layout = {}
-for layout in Layouts:
-    print(f"layout is {layout}")
-    env, base_env, IS_CIRCUIT, IS_CRAMPED,IS_RING, ckpt =sweep_layout(layout)
-    norm = get_layout_norm(layout, env, obsnorm_by_layout)
-    agent, rewards_log, soups_log = train_mappo_norm(env, norm, updates=2000, rollout_steps=2048, shaping_scale=1.0)
-    if ckpt:
-        agent.actor.load_state_dict(ckpt["actor"]); agent.critic.load_state_dict(ckpt["critic"])
-    results[layout.split('_')[0]] = {"reward": rewards_log, "soups": soups_log}
 
-# Plot both metrics
-plot_training_metrics(results, metric="reward",
-                      save_dir="plots", filename="mappo_reward_norm")
-plot_training_metrics(results, metric="soups",
-                      save_dir="plots", filename="mappo_soups_norm")
-#
-results = {}
-for layout in Layouts:
-    print(f"layout is {layout}")
-    env, base_env, IS_CIRCUIT, IS_CRAMPED,IS_RING, ckpt =sweep_layout(layout)
-    agent, rewards_log, soups_log = train_mappo(env, updates=2000, rollout_steps=2048, shaping_scale=1.0)
-    if ckpt:
-        agent.actor.load_state_dict(ckpt["actor"]); agent.critic.load_state_dict(ckpt["critic"])
-    results[layout.split('_')[0]] = {"reward": rewards_log, "soups": soups_log}
-# Plot both metrics
-plot_training_metrics(results, metric="reward",
-                      save_dir="plots", filename="mappo_reward")
-plot_training_metrics(results, metric="soups",
-                      save_dir="plots", filename="mappo_soups")
+if __name__ == "__main__":
+    Layouts=["cramped_room","coordination_ring","counter_circuit_o_1order"]
+    results = {}
+    obsnorm_by_layout = {}
+    for layout in Layouts:
+        print(f"layout is {layout}")
+        env, base_env, IS_CIRCUIT, IS_CRAMPED,IS_RING, ckpt =sweep_layout(layout)
+        norm = get_layout_norm(layout, env, obsnorm_by_layout)
+        agent, rewards_log, soups_log = train_mappo_norm(env, norm, updates=2000, rollout_steps=2048, shaping_scale=1.0)
+        if ckpt:
+            agent.actor.load_state_dict(ckpt["actor"]); agent.critic.load_state_dict(ckpt["critic"])
+        results[layout.split('_')[0]] = {"reward": rewards_log, "soups": soups_log}
 
-# layout="counter_circuit_o_1order"
-# mdp = OvercookedGridworld.from_layout_name(layout, rew_shaping_params=reward_shaping)
-# base_env = OvercookedEnv.from_mdp(mdp, horizon=horizon, info_level=0)
-# env = gym.make("Overcooked-v0", base_env=base_env, featurize_fn=base_env.featurize_state_mdp)
-# # agent, rewards_log, soups_log = train_mappo(env, updates=3, rollout_steps=2048, shaping_scale=1.0)
-# # Create an empty agent structure (so it has the same architecture)
-# obs = env.reset()
-# o0, o1 = get_obs_pair(obs)
-# obs_dim = o0.shape[0] + 2    # +2 if you used augment_obs
-# act_dim = env.action_space.n
-# agent = PPOMulti(obs_dim, act_dim, PPOCfg())
-#
-# # Load checkpoint weights and normalization statistics
-# file=f"overcooked_{layout}_norm.pt"
-# actor_sd, critic_sd, obsnorm = load_mappo_ckpt(file)
-# agent.actor.load_state_dict(actor_sd)
-# agent.critic.load_state_dict(critic_sd)
-# visualization_using_existing_flow(agent, layout="counter_circuit_o_1order", use_norm=True, obsnorm=obsnorm)
+    # Plot both metrics
+    plot_training_metrics(results, metric="reward",
+                          save_dir="plots", filename="mappo_reward_norm")
+    plot_training_metrics(results, metric="soups",
+                          save_dir="plots", filename="mappo_soups_norm")
+    #
+    # results = {}
+    # for layout in Layouts:
+    #     print(f"layout is {layout}")
+    #     env, base_env, IS_CIRCUIT, IS_CRAMPED,IS_RING, ckpt =sweep_layout(layout)
+    #     agent, rewards_log, soups_log = train_mappo(env, updates=2000, rollout_steps=2048, shaping_scale=1.0)
+    #     if ckpt:
+    #         agent.actor.load_state_dict(ckpt["actor"]); agent.critic.load_state_dict(ckpt["critic"])
+    #     results[layout.split('_')[0]] = {"reward": rewards_log, "soups": soups_log}
+    # # Plot both metrics
+    # plot_training_metrics(results, metric="reward",
+    #                       save_dir="plots", filename="mappo_reward")
+    # plot_training_metrics(results, metric="soups",
+    #                       save_dir="plots", filename="mappo_soups")
