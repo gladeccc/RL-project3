@@ -20,6 +20,7 @@ import torch.nn.functional as F
 from dataclasses import dataclass
 import matplotlib.pyplot as plt
 from gym.vector import AsyncVectorEnv
+from helpers import *
 
 ## Uncomment if you'd like to use your personal Google Drive to store outputs
 ## from your runs. You can find some hooks to Google Drive commented
@@ -56,11 +57,9 @@ reward_shaping = {
 # Length of Episodes.  Do not modify for your submission!
 # Modification will result in a grading penalty!
 horizon = 400
-
-
-
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 device = "cpu"
+INTERACT = 5
 def get_obs_pair(obs_dict):
     # Your env returns dict; features are already aligned for obs order
     return obs_dict["both_agent_obs"][0], obs_dict["both_agent_obs"][1]
@@ -199,6 +198,55 @@ def augment_obs(obs_vec, agent_idx, use_norm=False, obsnorm=None):
     agent_id = np.array([1, 0], dtype=np.float32) if agent_idx == 0 else np.array([0, 1], dtype=np.float32)
     return np.concatenate([obs_vec, agent_id], axis=-1)
 
+def compute_adv_ret_from_time_steps(rews, vals, dones, gamma=0.99, lam=0.95):
+    rews  = np.asarray(rews,  dtype=np.float32)
+    vals  = np.asarray(vals,  dtype=np.float32)
+    dones = np.asarray(dones, dtype=np.float32)
+    T = len(rews)
+    next_vals = np.concatenate([vals[1:], np.array([0.0], np.float32)])
+    next_mask = 1.0 - dones
+    deltas = rews + gamma * next_vals * next_mask - vals
+    adv = np.zeros_like(rews, dtype=np.float32)
+    gae = 0.0
+    for t in reversed(range(T)):
+        gae = deltas[t] + gamma * lam * next_mask[t] * gae
+        adv[t] = gae
+    ret = adv + vals
+    adv = (adv - adv.mean()) / (adv.std() + 1e-8)
+    return adv, ret
+
+def build_batch_from_time_steps(step_obs0, step_obs1,
+                                step_act0, step_act1,
+                                step_logp0, step_logp1,
+                                step_joint,
+                                adv, ret):
+    obs = np.vstack([np.asarray(step_obs0, dtype=np.float32),
+                     np.asarray(step_obs1, dtype=np.float32)])  # [2T, obs_dim]
+    act = np.concatenate([np.asarray(step_act0, dtype=np.int64),
+                          np.asarray(step_act1, dtype=np.int64)], axis=0)  # [2T]
+    logp = np.concatenate([np.asarray(step_logp0, dtype=np.float32),
+                           np.asarray(step_logp1, dtype=np.float32)], axis=0)
+    adv_b = np.concatenate([adv, adv], axis=0).astype(np.float32)  # [2T]
+    ret_b = np.concatenate([ret, ret], axis=0).astype(np.float32)  # [2T]
+    joint = np.vstack([np.asarray(step_joint, dtype=np.float32),
+                       np.asarray(step_joint, dtype=np.float32)])  # [2T, 2*obs_dim]
+    return {
+        "obs": obs, "act": act, "logp": logp,
+        "adv": adv_b, "ret": ret_b, "joint_obs": joint
+    }
+
+def sweep_layout(layout):
+    IS_CRAMPED = (layout == "cramped_room")
+    IS_RING = (layout == "coordination_ring")
+    IS_CIRCUIT = (layout == "counter_circuit_o_1order")
+    # Build the environment.  Do not modify!
+    mdp = OvercookedGridworld.from_layout_name(layout, rew_shaping_params=reward_shaping)
+    base_env = OvercookedEnv.from_mdp(mdp, horizon=horizon, info_level=0)
+    env = gym.make("Overcooked-v0", base_env=base_env, featurize_fn=base_env.featurize_state_mdp)
+    ckpt = None
+    return env, base_env, IS_CIRCUIT, IS_CRAMPED,IS_RING, ckpt
+
+
 class Actor(nn.Module):
     # Produces logits over 6 discrete actions for ONE agent
     def __init__(self, obs_dim, act_dim):
@@ -218,7 +266,7 @@ class CentralCritic(nn.Module):
 
 # ----- action masking: only press Interact when facing something useful -----
 # Action mapping we’ve been using: 0:stay, 1:up, 2:down, 3:left, 4:right, 5:interact
-INTERACT = 5
+
 @dataclass
 class PPOCfg:
     gamma: float = 0.99
@@ -304,43 +352,6 @@ class ObsNorm:
     def apply(self, x):
         var = np.clip(self.s / max(self.n-1, 1), 1e-3, 1e9)
         return (x - self.m) / np.sqrt(var)
-
-def compute_adv_ret_from_time_steps(rews, vals, dones, gamma=0.99, lam=0.95):
-    rews  = np.asarray(rews,  dtype=np.float32)
-    vals  = np.asarray(vals,  dtype=np.float32)
-    dones = np.asarray(dones, dtype=np.float32)
-    T = len(rews)
-    next_vals = np.concatenate([vals[1:], np.array([0.0], np.float32)])
-    next_mask = 1.0 - dones
-    deltas = rews + gamma * next_vals * next_mask - vals
-    adv = np.zeros_like(rews, dtype=np.float32)
-    gae = 0.0
-    for t in reversed(range(T)):
-        gae = deltas[t] + gamma * lam * next_mask[t] * gae
-        adv[t] = gae
-    ret = adv + vals
-    adv = (adv - adv.mean()) / (adv.std() + 1e-8)
-    return adv, ret
-
-def build_batch_from_time_steps(step_obs0, step_obs1,
-                                step_act0, step_act1,
-                                step_logp0, step_logp1,
-                                step_joint,
-                                adv, ret):
-    obs = np.vstack([np.asarray(step_obs0, dtype=np.float32),
-                     np.asarray(step_obs1, dtype=np.float32)])  # [2T, obs_dim]
-    act = np.concatenate([np.asarray(step_act0, dtype=np.int64),
-                          np.asarray(step_act1, dtype=np.int64)], axis=0)  # [2T]
-    logp = np.concatenate([np.asarray(step_logp0, dtype=np.float32),
-                           np.asarray(step_logp1, dtype=np.float32)], axis=0)
-    adv_b = np.concatenate([adv, adv], axis=0).astype(np.float32)  # [2T]
-    ret_b = np.concatenate([ret, ret], axis=0).astype(np.float32)  # [2T]
-    joint = np.vstack([np.asarray(step_joint, dtype=np.float32),
-                       np.asarray(step_joint, dtype=np.float32)])  # [2T, 2*obs_dim]
-    return {
-        "obs": obs, "act": act, "logp": logp,
-        "adv": adv_b, "ret": ret_b, "joint_obs": joint
-    }
 def train_mappo(env, updates=2000, rollout_steps=2048, shaping_scale=1.0):
     # Probe dims
     obs = env.reset()
@@ -660,10 +671,13 @@ def eval_soups_norm(agent, env, obsnorm, episodes=100):
          # Actor forward (greedy)
          o0_aug = augment_obs(o0n, 0)
          o1_aug = augment_obs(o1n, 1)
+
          x0 = torch.as_tensor(o0_aug[None, :], dtype=torch.float32, device=device)
          x1 = torch.as_tensor(o1_aug[None, :], dtype=torch.float32, device=device)
-         a0 = int(torch.argmax(agent.actor(x0), dim=-1).item())
-         a1 = int(torch.argmax(agent.actor(x1), dim=-1).item())            # Step env
+
+         a0 = int(agent.dist(agent.actor(x0)).sample().item())
+         a1 = int(agent.dist(agent.actor(x1)).sample().item())
+
          a0, a1 = mask_interact(o0, o1, a0, a1)  # same hygiene as training
 
          obs, R, done, info = env.step([a0, a1])
@@ -682,93 +696,39 @@ def eval_soups_norm(agent, env, obsnorm, episodes=100):
 
 # The below code is a partcular way to rollout episodes in a format
 # compatible with the built-in state visualizer.
-# ====== Policy wrapper compatible with AgentEvaluator/StateVisualizer ======
-def visulize(agent, ae, layout, horizon=400, use_norm=False, obsnorm=None,
-             img_root="imgs", ipython_display=False):
-    # Build evaluator for this layout to get the correct featurizer
-    featurize_fn = ae.env.featurize_state_mdp  # do NOT use global base_env
-
-    class StudentPolicy(NNPolicy):
-        """
-        Wraps the trained shared actor. Returns a probability vector over 6 actions.
-        """
-        def __init__(self, actor: Actor):
-            super().__init__()
-            self.actor = actor.eval()  # inference mode
-
-        def state_policy(self, state, agent_index):
-            # 1) 96-D features from the evaluator env
-            feats = featurize_fn(state)[agent_index]
-            # 2) If you trained with normalization, apply it here
-            if use_norm and (obsnorm is not None):
-                feats = obsnorm.apply(feats)
-            # 3) Append the 2-D agent one-hot used in training → 98-D
-            feats = augment_obs(feats, agent_index)
-
-            x = torch.as_tensor(feats, dtype=torch.float32, device=device).unsqueeze(0)
-            assert x.shape[-1] == agent.actor.body[0].in_features, \
-                f"Feature dim mismatch: got {x.shape[-1]}, expected {agent.actor.body[0].in_features}"
-            with torch.no_grad():
-                logits = agent.actor(x).squeeze(0).cpu().numpy()
-            probs = np.exp(logits - logits.max()); probs /= (probs.sum() + 1e-8)
-            return probs
-
-        def multi_state_policy(self, states, agent_indices):
-            return [self.state_policy(s, i) for s, i in zip(states, agent_indices)]
-
-    policy0 = StudentPolicy(agent.actor)
-    policy1 = StudentPolicy(agent.actor)
-    pair = AgentPair(AgentFromPolicy(policy0), AgentFromPolicy(policy1))
-
-    trajs = ae.evaluate_agent_pair(pair, num_games=1)
-    out_dir = os.path.join(img_root, layout)
-    os.makedirs(out_dir, exist_ok=True)
-    StateVisualizer().display_rendered_trajectory(
-        trajs, img_directory_path=out_dir, ipython_display=ipython_display
-    )
-    print("len(trajs):", len(trajs), "| saved to:", out_dir)
 
 # ====== Train MAPPO ======
-def sweep_layout(layout):
-    IS_CRAMPED = (layout == "cramped_room")
-    IS_RING = (layout == "coordination_ring")
-    IS_CIRCUIT = (layout == "counter_circuit_o_1order")
-    # Build the environment.  Do not modify!
-    mdp = OvercookedGridworld.from_layout_name(layout, rew_shaping_params=reward_shaping)
-    base_env = OvercookedEnv.from_mdp(mdp, horizon=horizon, info_level=0)
-    env = gym.make("Overcooked-v0", base_env=base_env, featurize_fn=base_env.featurize_state_mdp)
-    ckpt = None
-    return env, base_env, IS_CIRCUIT, IS_CRAMPED,IS_RING, ckpt
 
-Layouts=["cramped_room","coordination_ring","counter_circuit_o_1order"]
-#Layouts=["counter_circuit_o_1order"]
-results = {}
-obsnorm_by_layout = {}
-for layout in Layouts:
-    print(f"layout is {layout}")
-    env, base_env, IS_CIRCUIT, IS_CRAMPED,IS_RING, ckpt =sweep_layout(layout)
-    norm = get_layout_norm(layout, env, obsnorm_by_layout)
-    agent, rewards_log, soups_log = train_mappo_norm(env, norm, updates=2000, rollout_steps=2048, shaping_scale=1.0)
-    if ckpt:
-        agent.actor.load_state_dict(ckpt["actor"]); agent.critic.load_state_dict(ckpt["critic"])
-    results[layout.split('_')[0]] = {"reward": rewards_log, "soups": soups_log}
 
-# Plot both metrics
-plot_training_metrics(results, metric="reward",
-                      save_dir="plots", filename="mappo_reward_norm")
-plot_training_metrics(results, metric="soups",
-                      save_dir="plots", filename="mappo_soups_norm")
-#
-results = {}
-for layout in Layouts:
-    print(f"layout is {layout}")
-    env, base_env, IS_CIRCUIT, IS_CRAMPED,IS_RING, ckpt =sweep_layout(layout)
-    agent, rewards_log, soups_log = train_mappo(env, updates=2000, rollout_steps=2048, shaping_scale=1.0)
-    if ckpt:
-        agent.actor.load_state_dict(ckpt["actor"]); agent.critic.load_state_dict(ckpt["critic"])
-    results[layout.split('_')[0]] = {"reward": rewards_log, "soups": soups_log}
-# Plot both metrics
-plot_training_metrics(results, metric="reward",
-                      save_dir="plots", filename="mappo_reward")
-plot_training_metrics(results, metric="soups",
-                      save_dir="plots", filename="mappo_soups")
+if __name__ == "__main__":
+    Layouts=["cramped_room","coordination_ring","counter_circuit_o_1order"]
+    results = {}
+    obsnorm_by_layout = {}
+    for layout in Layouts:
+        print(f"layout is {layout}")
+        env, base_env, IS_CIRCUIT, IS_CRAMPED,IS_RING, ckpt =sweep_layout(layout)
+        norm = get_layout_norm(layout, env, obsnorm_by_layout)
+        agent, rewards_log, soups_log = train_mappo_norm(env, norm, updates=2000, rollout_steps=2048, shaping_scale=1.0)
+        if ckpt:
+            agent.actor.load_state_dict(ckpt["actor"]); agent.critic.load_state_dict(ckpt["critic"])
+        results[layout.split('_')[0]] = {"reward": rewards_log, "soups": soups_log}
+
+    # Plot both metrics
+    plot_training_metrics(results, metric="reward",
+                          save_dir="plots", filename="mappo_reward_norm")
+    plot_training_metrics(results, metric="soups",
+                          save_dir="plots", filename="mappo_soups_norm")
+    #
+    # results = {}
+    # for layout in Layouts:
+    #     print(f"layout is {layout}")
+    #     env, base_env, IS_CIRCUIT, IS_CRAMPED,IS_RING, ckpt =sweep_layout(layout)
+    #     agent, rewards_log, soups_log = train_mappo(env, updates=2000, rollout_steps=2048, shaping_scale=1.0)
+    #     if ckpt:
+    #         agent.actor.load_state_dict(ckpt["actor"]); agent.critic.load_state_dict(ckpt["critic"])
+    #     results[layout.split('_')[0]] = {"reward": rewards_log, "soups": soups_log}
+    # # Plot both metrics
+    # plot_training_metrics(results, metric="reward",
+    #                       save_dir="plots", filename="mappo_reward")
+    # plot_training_metrics(results, metric="soups",
+    #                       save_dir="plots", filename="mappo_soups")
