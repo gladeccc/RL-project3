@@ -136,7 +136,7 @@ def evaluate_across_layouts(layouts, episodes=100, smooth_window=10, Norm=False,
     return results
 
 if __name__ == "__main__":
-    layouts = [ "coordination_ring", "counter_circuit_o_1order"]
+    layouts = ["cramped_room", "coordination_ring", "counter_circuit_o_1order"]
     results = evaluate_across_layouts(
         layouts=layouts,
         episodes=100,

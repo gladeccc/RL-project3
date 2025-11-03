@@ -700,32 +700,31 @@ def eval_soups_norm(agent, env, obsnorm, episodes=100,evaluation=False):
 
 if __name__ == "__main__":
     Layouts=["cramped_room","coordination_ring","counter_circuit_o_1order"]
-    Layouts = ["cramped_room"]
-    # results = {}
-    # obsnorm_by_layout = {}
-    # for layout in Layouts:
-    #     print(f"layout is {layout}")
-    #     env, base_env, IS_CIRCUIT, IS_CRAMPED,IS_RING, ckpt =sweep_layout(layout)
-    #     norm = get_layout_norm(layout, env, obsnorm_by_layout)
-    #     agent, rewards_log, soups_log = train_mappo_norm(env, norm, updates=2000, rollout_steps=2048, shaping_scale=1.0)
-    #     if ckpt:
-    #         agent.actor.load_state_dict(ckpt["actor"]); agent.critic.load_state_dict(ckpt["critic"])
-    #     results[layout.split('_')[0]] = {"reward": rewards_log, "soups": soups_log}
-    #
-    # # Plot both metrics
-    # plot_training_metrics(results, metric="reward",
-    #                       save_dir="plots", filename="mappo_reward_norm")
-    # plot_training_metrics(results, metric="soups",
-    #                       save_dir="plots", filename="mappo_soups_norm")
-    #
     results = {}
+    obsnorm_by_layout = {}
     for layout in Layouts:
         print(f"layout is {layout}")
         env, base_env, IS_CIRCUIT, IS_CRAMPED,IS_RING, ckpt =sweep_layout(layout)
-        agent, rewards_log, soups_log = train_mappo(env, updates=2000, rollout_steps=2048, shaping_scale=1.0)
+        norm = get_layout_norm(layout, env, obsnorm_by_layout)
+        agent, rewards_log, soups_log = train_mappo_norm(env, norm, updates=2000, rollout_steps=2048, shaping_scale=1.0)
         if ckpt:
             agent.actor.load_state_dict(ckpt["actor"]); agent.critic.load_state_dict(ckpt["critic"])
         results[layout.split('_')[0]] = {"reward": rewards_log, "soups": soups_log}
+
+    # Plot both metrics
+    plot_training_metrics(results, metric="reward",
+                          save_dir="plots", filename="mappo_reward_norm")
+    plot_training_metrics(results, metric="soups",
+                          save_dir="plots", filename="mappo_soups_norm")
+    #
+    # results = {}
+    # for layout in Layouts:
+    #     print(f"layout is {layout}")
+    #     env, base_env, IS_CIRCUIT, IS_CRAMPED,IS_RING, ckpt =sweep_layout(layout)
+    #     agent, rewards_log, soups_log = train_mappo(env, updates=2000, rollout_steps=2048, shaping_scale=1.0)
+    #     if ckpt:
+    #         agent.actor.load_state_dict(ckpt["actor"]); agent.critic.load_state_dict(ckpt["critic"])
+    #     results[layout.split('_')[0]] = {"reward": rewards_log, "soups": soups_log}
     # # Plot both metrics
     # plot_training_metrics(results, metric="reward",
     #                       save_dir="plots", filename="mappo_reward")
