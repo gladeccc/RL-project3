@@ -40,7 +40,7 @@ reward_shaping = {
     # "NEAR_POT_REWARD": 1,
     # "NEAR_ONION_REWARD": 1,
     # "NEAR_DISH_REWARD": 1,
-    "ONION_PICKUP_REW": 1,
+    "ONION_PICKUP_REWARD": 1,
     "DISH_PICKUP_REWARD": 1,
     "SOUP_PICKUP_REWARD": 5,
     "PLACEMENT_IN_POT_REW": 4,
@@ -48,7 +48,7 @@ reward_shaping = {
     "PICKUP_WRONG_OBJ_PEN":-1,
     "USEFUL_INTERACT_REWARD": 2,
     "INVALID_INTERACT_PENALTY": -2,
-    "STEP_COST": 0
+    "STEP_COST": -0.01
 }
 
 # Length of Episodes.  Do not modify for your submission!
@@ -364,14 +364,14 @@ INTERACT = 5
 
 @dataclass
 class PPOCfg:
-    gamma: float = 0.99
+    gamma: float = 0.995
     lam: float = 0.95
-    clip: float = 0.1
+    clip: float = 0.2
     lr: float = 1e-4
-    ent_coef: float = 0.005
+    ent_coef: float = 0.02
     vf_coef: float = 0.5
     max_grad_norm: float = 0.5
-    rollout_env_steps: int = 2048  # env steps/update
+    rollout_env_steps: int = 4096  # env steps/update
     minibatch_size: int = 512
     opt_iters: int = 8
     total_updates: int = 1500
@@ -679,12 +679,12 @@ def train_mappo(env, updates=2000, rollout_steps=2048, shaping_scale=1.0):
     ae = AgentEvaluator.from_layout_name({"layout_name": layout}, {"horizon": horizon})
     for upd in range(1, agent.cfg.total_updates + 1):
         # simple entropy schedule (optional but helps)
-        if upd <= int(0.3 * agent.cfg.total_updates):
-            agent.cfg.ent_coef = 0.03
-        elif upd <= int(0.7 * agent.cfg.total_updates):
-            agent.cfg.ent_coef = 0.015
+        if upd <= int(0.6 * agent.cfg.total_updates):
+            agent.cfg.ent_coef = 0.02
+        elif upd <= int(0.9 * agent.cfg.total_updates):
+            agent.cfg.ent_coef = 0.01
         else:
-            agent.cfg.ent_coef = 0.007
+            agent.cfg.ent_coef = 0.005
 
         buf = {k: [] for k in ["obs","act","logp","rew","done","val","joint_obs"]}
         steps = 0
@@ -1035,8 +1035,6 @@ def eval_soups_norm(agent, env, obsnorm, episodes=20, hid=128):
             x1 = torch.as_tensor(o1_aug[None, None, :], dtype=torch.float32, device=device)
             h0_t = torch.as_tensor(h0, dtype=torch.float32, device=device)
             h1_t = torch.as_tensor(h1, dtype=torch.float32, device=device)
-
-
             logits0, h0_next = agent.actor(x0, h0_t)   # logits0: [1, 1, A]
             logits1, h1_next = agent.actor(x1, h1_t)
 
@@ -1044,19 +1042,15 @@ def eval_soups_norm(agent, env, obsnorm, episodes=20, hid=128):
             pi1 = torch.distributions.Categorical(logits=logits1[0, -1])
             a0 = int(pi0.sample().item())
             a1 = int(pi1.sample().item())
-
-
             a0, a1 = mask_interact(o0, o1, a0, a1)
 
 
             obs, R, done, info = env.step([a0, a1])
             ep_ret += float(R)
             soups += count_delivery(float(R), info)
-
             o0, o1 = obs["both_agent_obs"]
             h0 = h0_next.detach().cpu().numpy()
             h1 = h1_next.detach().cpu().numpy()
-
         rets.append(ep_ret)
 
     mean_reward = float(np.mean(rets))
