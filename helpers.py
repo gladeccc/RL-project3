@@ -88,10 +88,10 @@ def likely_legal_interact(feats: np.ndarray) -> bool:
 def mask_interact(obs0: np.ndarray, obs1: np.ndarray, a0: int, a1: int):
     """If Interact is unlikely, replace with a random move."""
     blocked = [False, False]
-    if a0 == INTERACT and not likely_legal_interact(obs0):
+    if a0 == 'INTERACT' and not likely_legal_interact(obs0):
         a0 = np.random.choice([1,2,3,4])
         blocked[0] = True   # NSEW
-    if a1 == INTERACT and not likely_legal_interact(obs1):
+    if a1 == 'INTERACT' and not likely_legal_interact(obs1):
         a1 = np.random.choice([1,2,3,4])
         blocked[1] = True
     if blocked[0] or blocked[1]:

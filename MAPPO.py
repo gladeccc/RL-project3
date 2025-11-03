@@ -441,7 +441,7 @@ def train_mappo(env, updates=2000, rollout_steps=2048, shaping_scale=1.0):
 
         # shaped-hit print (unchanged)
         shaped_hits = sum(1 for rr in buf["rew"] if (rr != 0.0 and rr < 20.0))
-        print(f"[upd {upd}] Regular： shaped_hit_rate={shaped_hits / len(buf['rew']):.3f}")
+        print(f"[upd {upd}] {layout} Regular： shaped_hit_rate={shaped_hits / len(buf['rew']):.3f}")
 
         for k in buf: buf[k] = np.asarray(buf[k], dtype=np.float32)
 
@@ -489,15 +489,14 @@ def train_mappo_norm(env,  obsnorm, updates=2000, rollout_steps=2048, shaping_sc
 
     best_soups = -1.0
     rewards_log, soups_log = [], []
-    ae = AgentEvaluator.from_layout_name({"layout_name": layout}, {"horizon": horizon})
     for upd in range(1, agent.cfg.total_updates + 1):
         # # simple entropy schedule (optional but helps)
-        # if upd <= int(0.3 * agent.cfg.total_updates):
-        #     agent.cfg.ent_coef = 0.03
-        # elif upd <= int(0.7 * agent.cfg.total_updates):
-        #     agent.cfg.ent_coef = 0.015
-        # else:
-        #     agent.cfg.ent_coef = 0.007
+        if upd <= int(0.3 * agent.cfg.total_updates):
+            agent.cfg.ent_coef = 0.03
+        elif upd <= int(0.7 * agent.cfg.total_updates):
+            agent.cfg.ent_coef = 0.015
+        else:
+            agent.cfg.ent_coef = 0.007
 
         buf = {k: [] for k in ["obs","act","logp","rew","done","val","joint_obs"]}
         steps = 0
@@ -566,7 +565,7 @@ def train_mappo_norm(env,  obsnorm, updates=2000, rollout_steps=2048, shaping_sc
 
         # shaped-hit print (unchanged)
         shaped_hits = sum(1 for rr in buf["rew"] if (rr != 0.0 and rr < 20.0))
-        print(f"[upd {upd}] Norm：shaped_hit_rate={shaped_hits / len(buf['rew']):.3f}")
+        print(f"[upd {upd}] {layout} Norm：shaped_hit_rate={shaped_hits / len(buf['rew']):.3f}")
 
         for k in buf: buf[k] = np.asarray(buf[k], dtype=np.float32)
 
@@ -596,7 +595,6 @@ def train_mappo_norm(env,  obsnorm, updates=2000, rollout_steps=2048, shaping_sc
         agent.update(batch)
 
         if upd % 10 == 0:
-            #visulize(agent,ae, layout)
             mean_ret, mean_soups = eval_soups_norm(agent, env, obsnorm,episodes=30)
             rewards_log.append(mean_ret)
             soups_log.append(mean_soups)
@@ -619,7 +617,7 @@ def train_mappo_norm(env,  obsnorm, updates=2000, rollout_steps=2048, shaping_sc
     return agent, rewards_log, soups_log
 
 @torch.no_grad()
-def eval_soups(agent, env, episodes=20):
+def eval_soups(agent, env, episodes=20,evaluation=False):
     rets, soups = [], 0
     for _ in range(episodes):
         obs = env.reset()
@@ -648,7 +646,7 @@ def eval_soups(agent, env, episodes=20):
     return float(np.mean(rets)), soups / float(episodes)
 
 @torch.no_grad()
-def eval_soups_norm(agent, env, obsnorm, episodes=100):
+def eval_soups_norm(agent, env, obsnorm, episodes=100,evaluation=False):
     """
     Evaluate MAPPO agent trained with normalized observations.
     Args:        agent: trained PPOMulti agent
@@ -702,31 +700,32 @@ def eval_soups_norm(agent, env, obsnorm, episodes=100):
 
 if __name__ == "__main__":
     Layouts=["cramped_room","coordination_ring","counter_circuit_o_1order"]
-    results = {}
-    obsnorm_by_layout = {}
-    for layout in Layouts:
-        print(f"layout is {layout}")
-        env, base_env, IS_CIRCUIT, IS_CRAMPED,IS_RING, ckpt =sweep_layout(layout)
-        norm = get_layout_norm(layout, env, obsnorm_by_layout)
-        agent, rewards_log, soups_log = train_mappo_norm(env, norm, updates=2000, rollout_steps=2048, shaping_scale=1.0)
-        if ckpt:
-            agent.actor.load_state_dict(ckpt["actor"]); agent.critic.load_state_dict(ckpt["critic"])
-        results[layout.split('_')[0]] = {"reward": rewards_log, "soups": soups_log}
-
-    # Plot both metrics
-    plot_training_metrics(results, metric="reward",
-                          save_dir="plots", filename="mappo_reward_norm")
-    plot_training_metrics(results, metric="soups",
-                          save_dir="plots", filename="mappo_soups_norm")
-    #
+    Layouts = ["cramped_room"]
     # results = {}
+    # obsnorm_by_layout = {}
     # for layout in Layouts:
     #     print(f"layout is {layout}")
     #     env, base_env, IS_CIRCUIT, IS_CRAMPED,IS_RING, ckpt =sweep_layout(layout)
-    #     agent, rewards_log, soups_log = train_mappo(env, updates=2000, rollout_steps=2048, shaping_scale=1.0)
+    #     norm = get_layout_norm(layout, env, obsnorm_by_layout)
+    #     agent, rewards_log, soups_log = train_mappo_norm(env, norm, updates=2000, rollout_steps=2048, shaping_scale=1.0)
     #     if ckpt:
     #         agent.actor.load_state_dict(ckpt["actor"]); agent.critic.load_state_dict(ckpt["critic"])
     #     results[layout.split('_')[0]] = {"reward": rewards_log, "soups": soups_log}
+    #
+    # # Plot both metrics
+    # plot_training_metrics(results, metric="reward",
+    #                       save_dir="plots", filename="mappo_reward_norm")
+    # plot_training_metrics(results, metric="soups",
+    #                       save_dir="plots", filename="mappo_soups_norm")
+    #
+    results = {}
+    for layout in Layouts:
+        print(f"layout is {layout}")
+        env, base_env, IS_CIRCUIT, IS_CRAMPED,IS_RING, ckpt =sweep_layout(layout)
+        agent, rewards_log, soups_log = train_mappo(env, updates=2000, rollout_steps=2048, shaping_scale=1.0)
+        if ckpt:
+            agent.actor.load_state_dict(ckpt["actor"]); agent.critic.load_state_dict(ckpt["critic"])
+        results[layout.split('_')[0]] = {"reward": rewards_log, "soups": soups_log}
     # # Plot both metrics
     # plot_training_metrics(results, metric="reward",
     #                       save_dir="plots", filename="mappo_reward")

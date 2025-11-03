@@ -7,45 +7,57 @@ from torch.distributions import Categorical
 import matplotlib.pyplot as plt
 from MAPPO import *
 from helpers import *
-def load_trained_model(layout,Norm=False):
+
+# --- utility: get the device of a module safely ---
+def module_device(module: torch.nn.Module):
+    """Return the device where a module's parameters live."""
+    return next(module.parameters()).device
+
+def load_trained_model(layout, Norm=False):
+    """
+    Load the trained Overcooked model with augmented input dimension = 98.
+    Reads actor, critic, and (optionally) ObsNorm statistics from the checkpoint.
+    """
+    # Build environment
     mdp = OvercookedGridworld.from_layout_name(layout, rew_shaping_params=reward_shaping)
     base_env = OvercookedEnv.from_mdp(mdp, horizon=horizon, info_level=0)
     env = gym.make("Overcooked-v0", base_env=base_env, featurize_fn=base_env.featurize_state_mdp)
 
-    obs = env.reset()
-    obs0, obs1 = obs["both_agent_obs"]
-    obs_dim = obs0.shape[0]
-    act_dim = env.action_space.n
-
-    # Instantiate models
-    actor = Actor(obs_dim, act_dim).to(device)
-    critic = CentralCritic(2*obs_dim).to(device)
-
     # Load checkpoint
+    ckpt_path = f"overcooked_{layout}_norm.pt" if Norm else f"overcooked_{layout}.pt"
+    ckpt = torch.load(ckpt_path, map_location=device)
+
+    # Rebuild ObsNorm if needed (constructor takes dimension)
+    obsnorm = None
     if Norm:
-        ckpt = torch.load(f"overcooked_{layout}_norm.pt", map_location=device)
-        obsnorm = ObsNorm(shape=ckpt["obsnorm_m"].shape)
+        obsnorm = ObsNorm(98)
         obsnorm.m = ckpt["obsnorm_m"]
         obsnorm.s = ckpt["obsnorm_s"]
         obsnorm.n = ckpt["obsnorm_n"]
-    else:
-        ckpt = torch.load(f"overcooked_{layout}.pt", map_location=device)
-        obsnorm=None
-    actor.load_state_dict(ckpt["actor"])
-    critic.load_state_dict(ckpt["critic"])
-    actor.eval()
-    critic.eval()
-    return env, actor,obsnorm
 
-    print(f"Loaded checkpoint {layout} successfully.")
+    # Build models with augmented dimension
+    obs_dim = 98                   # fixed augmented dim
+    act_dim = env.action_space.n   # discrete action count
+
+    actor = Actor(obs_dim, act_dim).to(device)
+    critic = CentralCritic(2 * obs_dim).to(device)
+
+    # Load weights strictly (must match keys and shapes)
+    actor.load_state_dict(ckpt["actor"], strict=True)
+    critic.load_state_dict(ckpt["critic"], strict=True)
+
+    actor.eval(); critic.eval()
+    print(f"Loaded {layout} model with obs_dim={obs_dim}, Norm={Norm}")
+    return env, actor, obsnorm
 
 def get_obs_pair(obs_dict):
-    # Your env returns dict; features are already aligned for obs order
+    """Return the two agents' observations from env output."""
     return obs_dict["both_agent_obs"][0], obs_dict["both_agent_obs"][1]
 
 def _eval_one_layout(env, actor, obsnorm, episodes=100):
     """Evaluate a single layout and return per-episode returns."""
     returns = []
+    dev = module_device(actor)
     actor.eval()
     with torch.no_grad():
         for _ in range(episodes):
@@ -59,18 +71,18 @@ def _eval_one_layout(env, actor, obsnorm, episodes=100):
                     o0 = obsnorm.apply(o0)
                     o1 = obsnorm.apply(o1)
 
-                # Feature augmentation matching your training pipeline
+                # Use the same augmentation pipeline as training
                 o0_aug = augment_obs(o0, agent_idx=0)
                 o1_aug = augment_obs(o1, agent_idx=1)
 
-                x0 = torch.as_tensor(o0_aug[None, :], dtype=torch.float32, device=actor.device)
-                x1 = torch.as_tensor(o1_aug[None, :], dtype=torch.float32, device=actor.device)
+                x0 = torch.as_tensor(o0_aug[None, :], dtype=torch.float32, device=dev)
+                x1 = torch.as_tensor(o1_aug[None, :], dtype=torch.float32, device=dev)
 
-                # Sample actions stochastically to mirror training-time behavior
+                # Stochastic evaluation to mirror training behavior
                 a0 = int(Categorical(logits=actor(x0)).sample().item())
                 a1 = int(Categorical(logits=actor(x1)).sample().item())
 
-                # Optional hygiene consistent with training
+                # Optional hygiene to keep actions legal/consistent
                 a0, a1 = mask_interact(o0, o1, a0, a1)
 
                 obs, R, done, info = env.step([a0, a1])
@@ -80,40 +92,24 @@ def _eval_one_layout(env, actor, obsnorm, episodes=100):
             returns.append(ep_ret)
     return returns
 
-
-def evaluate_across_layouts(load_fn, layouts, episodes=100, smooth_window=10, Norm=False,
+def evaluate_across_layouts(layouts, episodes=100, smooth_window=10, Norm=False,
                             save_path=None, show=False):
     """
     Evaluate the loaded model on multiple layouts and plot them in one figure.
-
-    Args:
-        load_fn: your loader, signature -> env, actor, obsnorm
-                 e.g. load_trained_model(layout, Norm)
-        layouts: list of layout names
-        episodes: episodes per layout
-        smooth_window: SMA window; 1/None disables smoothing
-        Norm: pass to loader to decide whether to load per-layout ObsNorm
-        save_path/show: figure output controls
-
-    Returns:
-        results: dict {layout: list_of_returns}
+    Returns: dict {layout: list_of_returns}
     """
     results = {}
 
     for layout in layouts:
-        # Load env/actor/obsnorm via your loader
-        env, actor, obsnorm = load_fn(layout, Norm=Norm)
-        # Evaluate this layout
+        env, actor, obsnorm = load_trained_model(layout, Norm=Norm)
         rets = _eval_one_layout(env, actor, obsnorm, episodes=episodes)
         results[layout] = rets
-
-        # Cleanup
         try:
             env.close()
         except Exception:
             pass
 
-    # ---- Plot all layouts in one figure ----
+    # Plot all layouts in one figure
     plt.figure(figsize=(10, 5.5))
     for layout, rets in results.items():
         x = np.arange(1, len(rets) + 1)
@@ -139,178 +135,13 @@ def evaluate_across_layouts(load_fn, layouts, episodes=100, smooth_window=10, No
 
     return results
 
-# def _is_adjacent(a, b):
-#     return abs(a[0]-b[0]) + abs(a[1]-b[1]) == 1
-#
-# def _get_static_stations(mdp):
-#     # Pull station coordinates from the MDP (layout graph)
-#     # These helpers exist on OvercookedGridworld
-#     onions = set(mdp.get_onion_dispenser_locations())
-#     dishes = set(mdp.get_dish_dispenser_locations())
-#     servs  = set(mdp.get_serving_locations())
-#     pots   = set([p[0] if isinstance(p, tuple) else p for p in mdp.get_pot_locations()])
-#     return onions, dishes, servs, pots
-#
-# def _held_symbol(player_obj):
-#     # player_obj: env.unwrapped.state.players[i]
-#     try:
-#         h = player_obj.held_object
-#         if h is None:         return "."
-#         t = getattr(h, "name", None) or getattr(h, "state", None) or str(h)
-#         t = str(t).lower()
-#         if "onion" in t:      return "o"
-#         if "dish" in t and "soup" not in t: return "d"
-#         if "soup" in t:       return "S"    # plated soup or soup object
-#         return "?"
-#     except Exception:
-#         return "."
-#
-# def _pot_status(base_env):
-#     # Try to summarize pot states. Works with overcooked_ai >= 1.2 style states.
-#     try:
-#         state = base_env.state
-#         pots = base_env.mdp.get_pots_pos_and_states(state)
-#         out = []
-#         for pos, pst in pots.items():
-#             # pst keys usually: 'cook_time', 'num_onions', 'has_water', 'ready'
-#             num = int(pst.get("num_onions", 0))
-#             ready = bool(pst.get("ready", False))
-#             ct = pst.get("cook_time", None)
-#             if ready:
-#                 tag = f"{pos}:READY"
-#             elif ct is not None and ct > 0:
-#                 tag = f"{pos}:cook{ct:02d}/{base_env.mdp.start_cook_time}"
-#             else:
-#                 tag = f"{pos}:onions{num}"
-#             out.append(tag)
-#         return "|".join(out) if out else "-"
-#     except Exception:
-#         return "-"  # graceful fallback if API differs
-#
-# def trace_episode(env, actor, steps=400, mask_interact=False):
-#     """
-#     Run one episode and print a compact timeline.
-#     - Shows agent positions, adjacency to [O]nion [P]ot [D]ish [V]Serve,
-#       held items, pot status, and events (3rd onion, cook start, ready, serve).
-#     - If mask_interact=True, applies your interact hygiene during rollout.
-#     """
-#     base_env = env.unwrapped.base_env
-#     mdp = base_env.mdp
-#     onions, dishes, servs, pots = _get_static_stations(mdp)
-#
-#     obs = env.reset()
-#     o0, o1 = obs["both_agent_obs"]
-#     done = False
-#
-#     deliveries = 0
-#     prev_num_onions = 0
-#     cooking_active = False
-#     served_steps = []
-#
-#     print("\nT |  A(x,y)  aAdj h |  B(x,y)  bAdj h |   Pot(s)                | Events")
-#     print("---+-------------------+-------------------+------------------------+-----------------")
-#
-#     for t in range(steps):
-#         # Positions and holds from true env state for correctness
-#         st = base_env.state
-#         A_pos = tuple(st.players_pos[0])
-#         B_pos = tuple(st.players_pos[1])
-#         A_hold = _held_symbol(st.players[0])
-#         B_hold = _held_symbol(st.players[1])
-#
-#         # Adjacency flags
-#         def adj_flags(pos):
-#             aO = any(_is_adjacent(pos, p) for p in onions)
-#             aP = any(_is_adjacent(pos, p) for p in pots)
-#             aD = any(_is_adjacent(pos, p) for p in dishes)
-#             aV = any(_is_adjacent(pos, p) for p in servs)  # V for deliVery slot
-#             s = "".join([c if f else "." for c, f in zip("OPDV", [aO, aP, aD, aV])])
-#             return s
-#
-#         A_adj = adj_flags(A_pos)
-#         B_adj = adj_flags(B_pos)
-#
-#         # Sample actions from actor
-#         with torch.no_grad():
-#             x0 = torch.as_tensor(o0[None, :], dtype=torch.float32, device=device)
-#             x1 = torch.as_tensor(o1[None, :], dtype=torch.float32, device=device)
-#             logits0 = actor(x0)
-#             logits1 = actor(x1)
-#
-#             # Optional: discourage 'stay' on narrow maps while tracing
-#             # STAY = 0
-#             # logits0[..., STAY] -= 0.5; logits1[..., STAY] -= 0.5
-#
-#             d0 = Categorical(logits=logits0)
-#             d1 = Categorical(logits=logits1)
-#             a0 = int(d0.sample().item())
-#             a1 = int(d1.sample().item())
-#
-#         # Optional interact hygiene
-#         if mask_interact:
-#             def _likely_legal_interact(feats):
-#                 v = feats.astype(np.int32)
-#                 for i in range(0, len(v)-1):
-#                     dx, dy = v[i], v[i+1]
-#                     if (abs(dx) == 1 and dy == 0) or (abs(dy) == 1 and dx == 0):
-#                         return True
-#                 return False
-#             INTERACT = 5
-#             if a0 == INTERACT and not _likely_legal_interact(o0): a0 = np.random.choice([1,2,3,4])
-#             if a1 == INTERACT and not _likely_legal_interact(o1): a1 = np.random.choice([1,2,3,4])
-#
-#         # Step env
-#         obs, R, done, info = env.step([a0, a1])
-#         o0, o1 = obs["both_agent_obs"]
-#
-#         # Pot/serve events
-#         pots_str = _pot_status(base_env)
-#         ev = []
-#         # Detect onion count rising to 3 on any pot
-#         try:
-#             # parse num_onions from pots_str best-effort
-#             if "onions" in pots_str:
-#                 # crude scan: ...:onionsN
-#                 import re
-#                 counts = [int(m.group(1)) for m in re.finditer(r"onions(\d+)", pots_str)]
-#                 if counts:
-#                     cur = max(counts)
-#                     if cur != prev_num_onions:
-#                         if cur == 3:
-#                             ev.append("3rd-ONION")
-#                         prev_num_onions = cur
-#         except Exception:
-#             pass
-#
-#         # Detect cook start/ready via pot status
-#         if "cook" in pots_str and not cooking_active:
-#             cooking_active = True
-#             ev.append("COOK-START")
-#         if "READY" in pots_str:
-#             ev.append("READY")
-#
-#         # Detect delivery by reward spike
-#         if float(R) >= 10.0:
-#             deliveries += 1
-#             served_steps.append(t)
-#             ev.append(f"SERVE(+20) total={deliveries}")
-#
-#         # Print timeline row
-#         print(f"{t:02d}| A{A_pos!s:>7} {A_adj} {A_hold} | B{B_pos!s:>7} {B_adj} {B_hold} | {pots_str:<22} | {';'.join(ev)}")
-#
-#         if done:
-#             break
-#
-#     print("\nEpisode done. Deliveries:", deliveries, "| Served at steps:", served_steps)
-
 if __name__ == "__main__":
-    layouts = ["cramped_room", "coordination_ring", "counter_circuit_o_1order"]
+    layouts = [ "coordination_ring", "counter_circuit_o_1order"]
     results = evaluate_across_layouts(
-        load_fn=load_trained_model,
         layouts=layouts,
         episodes=100,
         smooth_window=1,
-        Norm=True,  # or False
+        Norm=False,
         save_path="eval_multi_layouts.png",
         show=False
     )
