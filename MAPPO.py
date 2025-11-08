@@ -352,7 +352,7 @@ class ObsNorm:
     def apply(self, x):
         var = np.clip(self.s / max(self.n-1, 1), 1e-3, 1e9)
         return (x - self.m) / np.sqrt(var)
-def train_mappo(env, updates=2000, rollout_steps=2048, shaping_scale=1.0):
+def train_mappo(env, updates=2000, rollout_steps=2048, shaping_scale=1.0,layout="cramped_room"):
     # Probe dims
     obs = env.reset()
     o0, o1 = get_obs_pair(obs)
@@ -476,7 +476,7 @@ def train_mappo(env, updates=2000, rollout_steps=2048, shaping_scale=1.0):
     print(f"Best soups/ep observed: {best_soups:.2f}")
     return agent, rewards_log, soups_log
 
-def train_mappo_norm(env,  obsnorm, updates=2000, rollout_steps=2048, shaping_scale=1.0):
+def train_mappo_norm(env,  obsnorm, updates=2000, rollout_steps=2048, shaping_scale=1.0,layout="cramped_room"):
     # Probe dims
     obs = env.reset()
     #print("shaping keys:", env.unwrapped.base_env.mdp.reward_shaping_params)
@@ -707,7 +707,7 @@ if __name__ == "__main__":
     #     print(f"layout is {layout}")
     #     env, base_env, IS_CIRCUIT, IS_CRAMPED,IS_RING, ckpt =sweep_layout(layout)
     #     norm = get_layout_norm(layout, env, obsnorm_by_layout)
-    #     agent, rewards_log, soups_log = train_mappo_norm(env, norm, updates=2000, rollout_steps=2048, shaping_scale=1.0)
+    #     agent, rewards_log, soups_log = train_mappo_norm(env, norm, updates=2000, rollout_steps=2048, shaping_scale=1.0,layout=layout)
     #     if ckpt:
     #         agent.actor.load_state_dict(ckpt["actor"]); agent.critic.load_state_dict(ckpt["critic"])
     #     results[layout.split('_')[0]] = {"reward": rewards_log, "soups": soups_log}
@@ -722,7 +722,7 @@ if __name__ == "__main__":
     for layout in Layouts:
         print(f"layout is {layout}")
         env, base_env, IS_CIRCUIT, IS_CRAMPED,IS_RING, ckpt =sweep_layout(layout)
-        agent, rewards_log, soups_log = train_mappo(env, updates=2000, rollout_steps=2048, shaping_scale=1.0)
+        agent, rewards_log, soups_log = train_mappo(env, updates=2000, rollout_steps=2048, shaping_scale=1.0,layout=layout)
         if ckpt:
             agent.actor.load_state_dict(ckpt["actor"]); agent.critic.load_state_dict(ckpt["critic"])
         results[layout.split('_')[0]] = {"reward": rewards_log, "soups": soups_log}

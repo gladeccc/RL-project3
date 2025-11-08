@@ -5,7 +5,6 @@ import copy
 import itertools
 import time
 from MAPPO import *
-from helpers import *
 
 def clone_cfg(cfg: PPOCfg) -> PPOCfg:
     """Deep-copy PPO configuration."""
@@ -107,14 +106,16 @@ def tune_hyperparams(layout: str,
         setattr(cfg_out, name, type(getattr(cfg_out, name))(new_value))
         return cfg_out
 
-    results_for_plot = {}  # key -> {'reward': list, 'soups': list}
-    leaderboard = []       # list of dicts summarizing final metrics
+    results_grouped = {}  # {param_name: {run_key: {'reward': [...], 'soups': [...]}}}
+    leaderboard = []
     run_idx = 0
 
     if not grid:
         # One-factor-at-a-time sensitivity
         for param_name, shift_list in shifts.items():
             base_value = getattr(base, param_name)
+            results_grouped.setdefault(param_name, {})  # prepare group
+
             for shift in shift_list:
                 run_idx += 1
                 new_value = apply_shift_to_cfg(base, param_name, base_value, shift, mode)
@@ -129,10 +130,10 @@ def tune_hyperparams(layout: str,
                     eval_episodes=eval_episodes
                 )
 
-                # Store the whole curves for plotting
-                results_for_plot[run_key] = {
+                # Store under its parameter group
+                results_grouped[param_name][run_key] = {
                     "reward": out["rewards_log"],
-                    "soups":  out["soups_log"],
+                    "soups": out["soups_log"],
                 }
                 leaderboard.append({
                     "key": run_key,
@@ -142,7 +143,8 @@ def tune_hyperparams(layout: str,
                     "final_soups": out["final_soups"],
                 })
     else:
-        # Full factorial grid over all provided params
+        # Full factorial grid (kept as one combined plot set)
+        results_grouped = {"grid": {}}  # single bucket
         names = list(shifts.keys())
         shift_lists = [shifts[n] for n in names]
         for combo in itertools.product(*shift_lists):
@@ -163,9 +165,9 @@ def tune_hyperparams(layout: str,
                 rollout_steps=rollout_steps, shaping_scale=shaping_scale,
                 eval_episodes=eval_episodes
             )
-            results_for_plot[run_key] = {
+            results_grouped["grid"][run_key] = {
                 "reward": out["rewards_log"],
-                "soups":  out["soups_log"],
+                "soups": out["soups_log"],
             }
             leaderboard.append({
                 "key": run_key,
@@ -175,40 +177,30 @@ def tune_hyperparams(layout: str,
                 "final_soups": out["final_soups"],
             })
 
-    # === Plot curves using your existing helper ===
-    # reward curve
-    plot_training_metrics(
-        results_for_plot, metric="reward",
-        save_dir=save_dir, filename=f"{tag}_reward"
-    )
-    # soups curve
-    plot_training_metrics(
-        results_for_plot, metric="soups",
-        save_dir=save_dir, filename=f"{tag}_soups"
-    )
-
-    # Sort leaderboard by final soups then reward
-    leaderboard.sort(key=lambda d: (d["final_soups"], d["final_ret"]), reverse=True)
-
-    print("\n=== Leaderboard (top 10 by final soups, then reward) ===")
-    for row in leaderboard[:10]:
-        print(f"{row['key']:40s} | soups={row['final_soups']:.3f} | reward={row['final_ret']:.1f}")
-
-    return results_for_plot, leaderboard
+    # --- per-parameter plotting ---
+    for group_name, results_for_plot in results_grouped.items():
+        plot_training_metrics(
+            results_for_plot, metric="reward",
+            save_dir=save_dir, filename=f"{tag}_{group_name}_reward"
+        )
+        plot_training_metrics(
+            results_for_plot, metric="soups",
+            save_dir=save_dir, filename=f"{tag}_{group_name}_soups"
+        )
 
 if __name__ == "__main__":
     shifts = {
-        "lr": [0.3, 1.0, 3.0],
-        "clip": [0.75, 1.0, 1.25],
-        "opt_iters": [0.5, 1.0, 2.0],  # will be multiplied and cast back to int
+        "lr": [0.2, 0.5, 1.0, 2.0, 3.0],
+        "clip":[0.2,0.5,1,2,3],
+        "gamma": [0.2, 0.5, 1, 2, 3]
     }
-    results, board = tune_hyperparams(
+    tune_hyperparams(
         layout="cramped_room",
         shifts=shifts,
         base_cfg=PPOCfg(),  # or your tuned base
         mode="mul",
-        norm=True,
-        updates=400,  # keep small for sweeps
+        norm=False,
+        updates=800,  # keep small for sweeps
         rollout_steps=1024,
         shaping_scale=1.0,
         eval_episodes=30,

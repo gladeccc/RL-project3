@@ -366,7 +366,7 @@ INTERACT = 5
 class PPOCfg:
     gamma: float = 0.995
     lam: float = 0.95
-    clip: float = 0.2
+    clip: float = 0.04
     lr: float = 1e-4
     ent_coef: float = 0.02
     vf_coef: float = 0.5
